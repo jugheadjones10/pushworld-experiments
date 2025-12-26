@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=64.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pushworld-experiments"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+
+dependencies = [
+    "numpy",
+    "jax",
+    "flax",
+    "chex",
+    "gymnax",
+]
+
+[project.optional-dependencies]
+experiments = [
+    "distrax",
+    "optax",
+    "orbax-checkpoint==0.5.3",
+    "orbax",
+    "wandb",
+    "pillow",
+    "imageio",
+    "moviepy"
+]
+
+
+[tool.setuptools.packages.find]
+include = ["jaxued*"]
