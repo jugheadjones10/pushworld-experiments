@@ -33,3 +33,9 @@ minimum_fill_ratio: 0.0  # Buffer is pre-filled
 
 # === Run name ===
 run_name: pushworld_plr_benchmark
+
+# === Wandb (override defaults from misc/misc.yaml) ===
+use_wandb: true
+wandb_project: pushworld-plr
+wandb_entity: null
+wandb_mode: online
