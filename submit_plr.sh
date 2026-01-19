@@ -27,7 +27,8 @@ set -e
 #-------------------------------------------------------------------------------
 GPU_TYPE="h100-96"  # Default to H100-96 (available on gpu-long)
 PARTITION=""        # Auto-set based on GPU type
-CONFIG="pushworld_plr"  # Hydra config name
+CONFIG="pushworld_plr"  # Hydra config name (pushworld_plr or pushworld_plr_benchmark)
+SCRIPT="pushworld_plr"  # Script to run (pushworld_plr or pushworld_plr_benchmark)
 NUM_UPDATES=""      # Will use config default if empty
 SEED=""             # Will use config default if empty
 RUN_NAME=""         # Will be auto-generated if empty
@@ -56,8 +57,9 @@ show_help() {
     echo "  nv         V100/Titan/T4        (max 2 per node)"
     echo ""
     echo "Training Options:"
-    echo "  --config=NAME       Hydra config name (default: pushworld_plr)"
-    echo "                      Options: pushworld_plr, pushworld_plr_benchmark"
+    echo "  --benchmark         Use benchmark training (shortcut for --script/--config)"
+    echo "  --script=NAME       Script to run: pushworld_plr or pushworld_plr_benchmark"
+    echo "  --config=NAME       Hydra config name (default: matches script)"
     echo "  --updates=N         Number of training updates (default: from config)"
     echo "  --seed=N            Random seed (default: from config)"
     echo "  --run-name=NAME     Run name for checkpoints/wandb"
@@ -84,6 +86,8 @@ for arg in "$@"; do
         --gpu=*)            GPU_TYPE="${arg#*=}" ;;
         --partition=*)      PARTITION="${arg#*=}" ;;
         --config=*)         CONFIG="${arg#*=}" ;;
+        --script=*)         SCRIPT="${arg#*=}" ;;
+        --benchmark)        SCRIPT="pushworld_plr_benchmark"; CONFIG="pushworld_plr_benchmark" ;;
         --updates=*)        NUM_UPDATES="${arg#*=}" ;;
         --seed=*)           SEED="${arg#*=}" ;;
         --run-name=*)       RUN_NAME="${arg#*=}" ;;
@@ -245,6 +249,12 @@ echo "============================================================"
 # Change to project directory
 cd ~/pushworld-experiments || { echo "Error: ~/pushworld-experiments not found"; exit 1; }
 
+# Activate virtual environment if it exists
+if [ -d ".venv" ]; then
+    echo "Activating virtual environment..."
+    source .venv/bin/activate
+fi
+
 # Print GPU info
 echo ""
 echo "GPU Info:"
@@ -254,14 +264,14 @@ echo ""
 # Set up JAX to use GPU
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.90
-export JAX_PLATFORMS=cuda
 
 # Print Python/JAX info
-echo "Python: $(which python3) ($(python3 --version 2>&1))"
+echo "Python: $(which python) ($(python --version 2>&1))"
 echo ""
 
 # Verify JAX can see GPU
-python3 -c "import jax; print(f'JAX devices: {jax.devices()}')"
+echo "Checking JAX GPU support..."
+python -c "import jax; devices = jax.devices(); print(f'JAX devices: {devices}'); assert any('cuda' in str(d).lower() or 'gpu' in str(d).lower() for d in devices), 'No GPU found! Install JAX with CUDA: pip install -U \"jax[cuda12]\"'"
 echo ""
 
 SLURM_EOF
@@ -270,6 +280,7 @@ SLURM_EOF
 cat >> "$SLURM_SCRIPT" << EOF
 
 echo "Training Configuration:"
+echo "  Script:      ${SCRIPT}.py"
 echo "  Config:      ${CONFIG}"
 echo "  Run Name:    ${RUN_NAME}"
 echo "  GPU:         ${GPU_TYPE}"
@@ -278,7 +289,7 @@ echo ""
 
 echo "Starting training..."
 
-python3 experiments/pushworld_plr.py \\
+python experiments/${SCRIPT}.py \\
     --config-name=${CONFIG} \\
     ${HYDRA_OVERRIDES}
 
@@ -303,6 +314,7 @@ echo ""
 echo "============================================================"
 echo "SLURM Job Configuration"
 echo "============================================================"
+echo "Script:       ${SCRIPT}.py"
 echo "GPU:          ${GPU_TYPE}"
 echo "Partition:    ${PARTITION}"
 echo "GRES:         ${SLURM_GRES}"

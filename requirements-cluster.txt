@@ -1,13 +1,22 @@
 # Requirements for PushWorld PLR training on GPU cluster
-# Install with: pip install --user -r requirements-cluster.txt
 #
-# Note: For JAX with GPU support, you may need to install jax[cuda] separately:
-#   pip install --upgrade "jax[cuda12]"
-# or match your cluster's CUDA version
+# IMPORTANT: JAX GPU Installation
+# ================================
+# JAX requires CUDA-specific installation. Do NOT use this file directly.
+# Instead, run the setup script or follow these steps:
+#
+# 1. Create venv:    python -m venv .venv && source .venv/bin/activate
+# 2. Install JAX:    pip install -U "jax[cuda12]"   # For CUDA 12.x
+#                    pip install -U "jax[cuda11]"   # For CUDA 11.x
+# 3. Install deps:   pip install -r requirements-cluster.txt
+# 4. Install pkg:    pip install -e .
+#
+# Check CUDA version: nvcc --version or nvidia-smi
 
-# Core JAX stack
-jax>=0.4.20
-jaxlib>=0.4.20
+# Core JAX stack (GPU version installed separately - see above)
+# jax[cuda12] is installed first, these are just version pins
+# jax>=0.4.20
+# jaxlib>=0.4.20
 flax>=0.8.0
 chex>=0.1.8
 optax>=0.1.7
@@ -20,7 +29,8 @@ gymnax>=0.0.6
 # Config & logging
 hydra-core>=1.3.0
 omegaconf>=2.3.0
-wandb>=0.16.0
+wandb[media]>=0.16.0
+moviepy  # For wandb video logging
 
 # Utilities
 numpy>=1.24.0,<2.0
