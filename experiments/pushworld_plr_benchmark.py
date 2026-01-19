@@ -543,14 +543,15 @@ def main(cfg: DictConfig):
     benchmark_name = config.get("benchmark_name")
     benchmark_path = config.get("benchmark_path")
     
-    if benchmark_name:
+    if benchmark_path:
+        # Load from explicit path (takes priority over name)
+        benchmark_path = os.path.expanduser(benchmark_path)  # Expand ~ to home dir
+        print(f"Loading benchmark from path: {benchmark_path}")
+        benchmark = Benchmark.load_from_path(benchmark_path)
+    elif benchmark_name:
         # Load by name (auto-downloads from HuggingFace if needed)
         print(f"Loading benchmark by name: {benchmark_name}")
         benchmark = Benchmark.load(benchmark_name)
-    elif benchmark_path:
-        # Load from explicit path
-        print(f"Loading benchmark from path: {benchmark_path}")
-        benchmark = Benchmark.load_from_path(benchmark_path)
     else:
         raise ValueError("Must specify either 'benchmark_name' or 'benchmark_path' in config")
     num_train_puzzles = benchmark.num_train_puzzles()

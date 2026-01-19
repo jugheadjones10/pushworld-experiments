@@ -7,11 +7,10 @@
 # === BENCHMARK CONFIG ===
 # Option 1: Load by name (auto-downloads from HuggingFace if needed)
 # Available names: 'level0_transformed_all', 'level0_transformed_base', 'level0_mini'
-benchmark_name: level0_transformed_all
+benchmark_name: null  # Set to null when using benchmark_path
 
-# Option 2: Load from explicit path (uncomment to use instead)
-# benchmark_path: /path/to/your/benchmark.pkl
-benchmark_path: null
+# Option 2: Load from explicit path (set benchmark_name to null to use this)
+benchmark_path: ~/pushworld-experiments/pushworld_level0_transformed_all.pkl
 
 # === Environment ===
 env_name: pushworld
