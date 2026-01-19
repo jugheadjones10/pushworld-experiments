@@ -2,13 +2,7 @@
 # 
 # This config uses a FIXED BENCHMARK of puzzles instead of random generation.
 # PLR prioritizes which puzzles to train on based on learning signal.
-
-defaults:
-  - learning/ppo
-  - ued/plr
-  - misc/misc
-  - eval/pushworld
-  - _self_
+# All settings in one file (no defaults composition for compatibility)
 
 # === BENCHMARK CONFIG ===
 # Option 1: Load by name (auto-downloads from HuggingFace if needed)
@@ -19,23 +13,67 @@ benchmark_name: level0_transformed_all
 # benchmark_path: /path/to/your/benchmark.pkl
 benchmark_path: null
 
-# === ENVIRONMENT CONFIG ===
+# === Environment ===
+env_name: pushworld
 grid_size: 10
 penalize_time: true
 reward_shaping: false
 max_steps_in_episode: 100
 
-# === Override PLR settings for benchmark mode ===
-# Since we have a fixed set of puzzles, we don't need minimum_fill_ratio
-# The buffer is pre-filled with all training puzzles at startup
+# === PPO Learning ===
+lr: 1e-4
+max_grad_norm: 0.5
+num_steps: 256
+num_train_envs: 32
+num_minibatches: 1
+gamma: 0.995
+epoch_ppo: 5
+clip_eps: 0.2
+gae_lambda: 0.98
+entropy_coeff: 1e-3
+critic_coeff: 0.5
+
+# === PLR (Prioritized Level Replay) ===
+use_accel: false
+exploratory_grad_updates: false
+num_edits: 5
+score_function: MaxMC  # MaxMC or pvl
+level_buffer_capacity: 4000
 replay_prob: 1.0  # Always replay (no DR since we don't generate new levels)
-minimum_fill_ratio: 0.0  # Buffer is pre-filled
+staleness_coeff: 0.3
+temperature: 0.3
+topk_k: 4
+minimum_fill_ratio: 0.0  # Buffer is pre-filled, start replaying immediately
+prioritization: rank  # rank or topk
+buffer_duplicate_check: false  # No duplicates since we load fixed puzzles
 
-# === Run name ===
-run_name: pushworld_plr_benchmark
+# === Evaluation ===
+eval_freq: 250
+eval_num_attempts: 10
+eval_levels:
+  - TrivialPush
+  - SimplePush
+  - TwoGoals
+  - ChainPush
+  - WallMaze
+  - Test131
+  - Test22
+  - Test23
 
-# === Wandb (override defaults from misc/misc.yaml) ===
+# === Misc ===
+seed: 0
 use_wandb: true
 wandb_project: pushworld-plr
 wandb_entity: null
 wandb_mode: online
+save_path: checkpoints
+save_policy: true
+checkpoint_save_interval: 2
+max_number_of_checkpoints: 60
+mode: train  # train or eval
+checkpoint_directory: null
+checkpoint_to_eval: -1
+
+# === Training ===
+num_updates: 30000
+run_name: pushworld_plr_benchmark
