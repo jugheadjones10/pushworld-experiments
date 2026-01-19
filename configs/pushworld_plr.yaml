@@ -1,0 +1,65 @@
+# PushWorld PLR Training Configuration
+# All settings in one file (no defaults composition)
+
+# === Environment ===
+env_name: pushworld
+grid_size: 10
+penalize_time: true
+reward_shaping: false
+n_walls: 10
+n_movables: 1
+max_steps_in_episode: 100
+
+# === PPO Learning ===
+lr: 1e-4
+max_grad_norm: 0.5
+num_steps: 256
+num_train_envs: 32
+num_minibatches: 1
+gamma: 0.995
+epoch_ppo: 5
+clip_eps: 0.2
+gae_lambda: 0.98
+entropy_coeff: 1e-3
+critic_coeff: 0.5
+
+# === PLR (Prioritized Level Replay) ===
+use_accel: false
+exploratory_grad_updates: false
+num_edits: 5
+score_function: MaxMC  # MaxMC or pvl
+level_buffer_capacity: 4000
+replay_prob: 0.8
+staleness_coeff: 0.3
+temperature: 0.3
+topk_k: 4
+minimum_fill_ratio: 0.5
+prioritization: rank  # rank or topk
+buffer_duplicate_check: true
+
+# === Evaluation ===
+eval_freq: 250
+eval_num_attempts: 10
+eval_levels:
+  - TrivialPush
+  - SimplePush
+  - TwoGoals
+  - ChainPush
+
+# === Misc ===
+seed: 0
+use_wandb: false
+wandb_project: JAXUED_TEST
+wandb_entity: null
+wandb_mode: online
+save_path: checkpoints
+save_policy: true
+checkpoint_save_interval: 2
+max_number_of_checkpoints: 60
+mode: train  # train or eval
+checkpoint_directory: null
+checkpoint_to_eval: -1
+
+# === Training ===
+num_updates: 30000
+run_name: pushworld_plr

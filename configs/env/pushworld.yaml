@@ -1,0 +1,8 @@
+# PushWorld environment configuration
+env_name: pushworld
+grid_size: 10
+penalize_time: true
+reward_shaping: false
+n_walls: 10
+n_movables: 1
+max_steps_in_episode: 100

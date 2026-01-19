@@ -1,0 +1,12 @@
+# Maze PLR Training Configuration
+defaults:
+  - env/maze
+  - learning/ppo
+  - ued/plr
+  - eval/maze
+  - misc/misc
+  - _self_
+
+# Training settings
+num_updates: 30000
+run_name: maze_plr

@@ -1,111 +1,126 @@
-from typing import Tuple
+"""
+PushWorld Environment implementation for the "All" variant.
+
+This is a JAX-based implementation of the PushWorld puzzle environment,
+compatible with the UnderspecifiedEnv interface for use with PLR.
+
+Key features:
+- 10x10 grid
+- Multi-pixel polyomino objects
+- 4 movable objects (m1-m4), 2 goals (g1-g2)
+- Wave-front collision detection for pushing chains
+- Full observation (no partial/egocentric view)
+"""
+
 from enum import IntEnum
-import jax
-import jax.numpy as jnp
+from typing import Tuple
+
 import chex
+import jax
+import jax.lax as lax
+import jax.numpy as jnp
 from flax import struct
 from gymnax.environments import spaces
+
 from jaxued.environments import UnderspecifiedEnv
-from .level import Level, prefabs
+
+from .level import GRID_SIZE, Level
+
 
 class Actions(IntEnum):
-    left = 0    # Turn left
-    right = 1   # Turn right
-    forward = 2 # Move forward
-    pickup = 3  # Pick up an object
-    drop = 4    # Drop an object
-    toggle = 5  # Toggle/activate an object
-    done = 6    # Done completing task
-    
-OBJECT_TO_INDEX = {
-    "unseen": 0,
-    "empty": 1,
-    "wall": 2,
-    "floor": 3,
-    "door": 4,
-    "key": 5,
-    "ball": 6,
-    "box": 7,
-    "goal": 8,
-    "lava": 9,
-    "agent": 10,
-}
+    """PushWorld uses 4 cardinal movement actions."""
 
-COLORS = {
-    'red'   : jnp.array([255, 0, 0]),
-    'green' : jnp.array([0, 255, 0]),
-    'blue'  : jnp.array([0, 0, 255]),
-    'purple': jnp.array([112, 39, 195]),
-    'yellow': jnp.array([255, 255, 0]),
-    'grey'  : jnp.array([100, 100, 100]),
-}
+    up = 0
+    right = 1
+    down = 2
+    left = 3
 
-COLOR_TO_INDEX = {
-    'red'   : 0,
-    'green' : 1,
-    'blue'  : 2,
-    'purple': 3,
-    'yellow': 4,
-    'grey'  : 5,
-}
 
-# Map of agent direction indices to vectors
-DIR_TO_VEC = jnp.array([
-    (1, 0), # right
-    (0, 1), # down
-    (-1, 0), # left
-    (0, -1), # up
-], dtype=jnp.int8)
+# Direction vectors for each action
+DISPLACEMENTS = jnp.array(
+    [
+        (0, -1),  # UP
+        (1, 0),  # RIGHT
+        (0, 1),  # DOWN
+        (-1, 0),  # LEFT
+    ],
+    dtype=jnp.int32,
+)
+
+
+# Channel indices for observation
+CHANNEL_AGENT = 0
+CHANNEL_M1 = 1
+CHANNEL_M2 = 2
+CHANNEL_M3 = 3
+CHANNEL_M4 = 4
+CHANNEL_G1 = 5
+CHANNEL_G2 = 6
+CHANNEL_WALL = 7
+NUM_CHANNELS = 8
+
+
+# Rewards
+SUCCESS_REWARD = 10.0
+STEP_REWARD = -0.01
+GOAL_PROGRESS_REWARD = 1.0
+
 
 @struct.dataclass
 class EnvState:
-    agent_pos: chex.Array
-    agent_dir: int
-    goal_pos: chex.Array
+    """State of the PushWorld environment."""
+
+    # Object positions - each is (MAX_PIXELS, 2) with -1 padding
+    agent_pos: chex.Array  # Current agent position
+    m1_pos: chex.Array  # Movable 1 position
+    m2_pos: chex.Array  # Movable 2 position
+    m3_pos: chex.Array  # Movable 3 position
+    m4_pos: chex.Array  # Movable 4 position
+    # Goal positions (fixed for the level)
+    g1_pos: chex.Array
+    g2_pos: chex.Array
+    # Wall map
     wall_map: chex.Array
-    maze_map: chex.Array
+    # Episode tracking
     time: int
     terminal: bool
 
+
 @struct.dataclass
 class Observation:
-    image: chex.Array
-    agent_dir: int
+    """Observation for PushWorld - full grid view with 8 channels."""
+
+    image: chex.Array  # Shape: (GRID_SIZE, GRID_SIZE, NUM_CHANNELS)
+
 
 @struct.dataclass
 class EnvParams:
-    max_steps_in_episode: int = 250
-    
-class Maze(UnderspecifiedEnv):
-    """This is an implementation of a Maze in a minigrid-style environment.
+    max_steps_in_episode: int = 100
+
+
+class PushWorld(UnderspecifiedEnv):
+    """PushWorld environment implementation.
+
+    This is the "All" variant with:
+    - 10x10 grid
+    - Multi-pixel objects (polyominoes)
+    - 4 movable objects, 2 goals
+    - Wave-front push mechanics
 
     Args:
-        max_height (int, optional): The maximum height. Levels themselves can be smaller than this. Defaults to 13.
-        max_width (int, optional): The maximum width. Defaults to 13.
-        agent_view_size (int, optional): The number of tiles the agent can see in front of itself. Defaults to 5.
-        see_agent (bool, optional): If this is true, the agent's observation includes the agent. By default this is false, which is fine because the observation is egocentric, so the agent is always at the same position in the observation. Defaults to False.
-        normalize_obs (bool, optional): If true, divides the observations by 10 to normalize them. Defaults to False.
-        fully_obs (bool, optional): If this is true, the agent sees the entire grid. Defaults to False.
-        penalize_time (bool, optional): If this is true, the reward for obtaining the goal decreases at every tim. Defaults to True.
+        penalize_time: If True, adds a small negative reward per step.
+        reward_shaping: If True, gives intermediate rewards for goal progress.
     """
+
     def __init__(
         self,
-        max_height=13,
-        max_width=13,
-        agent_view_size=5,
-        see_agent = False,
-        normalize_obs = False,
-        fully_obs = False,
-        penalize_time = True,
+        penalize_time: bool = True,
+        reward_shaping: bool = False,
     ):
         super().__init__()
-        self.max_height = max_height
-        self.max_width = max_width
-        self.agent_view_size = agent_view_size
-        self.see_agent = see_agent
-        self.normalize_obs = normalize_obs
-        self.fully_obs = fully_obs
+        self.grid_size = GRID_SIZE
         self.penalize_time = penalize_time
+        self.reward_shaping = reward_shaping
 
     @property
     def default_params(self) -> EnvParams:
@@ -119,25 +134,37 @@ class Maze(UnderspecifiedEnv):
         params: EnvParams,
     ) -> Tuple[Observation, EnvState, float, bool, dict]:
         """Perform single timestep state transition."""
-        state, reward = self._step_agent(rng, state, action, params)
-        # Check game condition & no. steps for termination condition
+        # Get observation before action (for reward shaping)
+        prev_obs = self.get_obs(state) if self.reward_shaping else None
+
+        # Execute action
+        state = self._step_agent(state, action)
+
+        # Update time
         state = state.replace(time=state.time + 1)
+
+        # Get new observation
+        obs = self.get_obs(state)
+
+        # Check goal condition
+        goal_reached = self._check_goal(obs)
+        state = state.replace(terminal=goal_reached)
+
+        # Check termination
         done = self.is_terminal(state, params)
-        state = state.replace(terminal=done)
-        return (
-            self.get_obs(state),
-            state,
-            reward.astype(jnp.float32),
-            done,
-            {},
-        )
-        
+
+        # Compute reward
+        reward = self._compute_reward(prev_obs, obs, goal_reached, state, params)
+
+        return obs, state, reward, done, {}
+
     def reset_env_to_level(
         self,
         rng: chex.PRNGKey,
         level: Level,
-        params: EnvParams
+        params: EnvParams,
     ) -> Tuple[Observation, EnvState]:
+        """Reset environment to a specific level."""
         state = self.init_state_from_level(level)
         return self.get_obs(state), state
 
@@ -145,144 +172,288 @@ class Maze(UnderspecifiedEnv):
         """Action space of the environment."""
         return spaces.Discrete(len(Actions))
 
-    # ===
-    
+    def observation_space(self, params: EnvParams) -> spaces.Box:
+        """Observation space of the environment."""
+        return spaces.Box(
+            low=0,
+            high=1,
+            shape=(self.grid_size, self.grid_size, NUM_CHANNELS),
+            dtype=jnp.float32,
+        )
+
+    # =========================================================================
+    # Internal methods
+    # =========================================================================
+
     def init_state_from_level(self, level: Level) -> EnvState:
-        maze_map = make_maze_map(level, self.agent_view_size-1)
+        """Initialize environment state from a Level."""
         return EnvState(
-            agent_pos=jnp.array(level.agent_pos, dtype=jnp.uint32),
-            agent_dir=jnp.array(level.agent_dir, dtype=jnp.uint8),
-            goal_pos=jnp.array(level.goal_pos, dtype=jnp.uint32),
-            wall_map=jnp.array(level.wall_map, dtype=jnp.bool_),
-            maze_map=maze_map,
+            agent_pos=level.agent_pos.astype(jnp.int32),
+            m1_pos=level.m1_pos.astype(jnp.int32),
+            m2_pos=level.m2_pos.astype(jnp.int32),
+            m3_pos=level.m3_pos.astype(jnp.int32),
+            m4_pos=level.m4_pos.astype(jnp.int32),
+            g1_pos=level.g1_pos.astype(jnp.int32),
+            g2_pos=level.g2_pos.astype(jnp.int32),
+            wall_map=level.wall_map.astype(jnp.bool_),
             time=0,
             terminal=False,
         )
 
     def get_obs(self, state: EnvState) -> Observation:
-        if self.fully_obs:
-            return self._get_full_obs(state)
-        return self._get_partial_obs(state)
+        """Get full observation as multi-channel grid."""
+        obs = jnp.zeros(
+            (self.grid_size, self.grid_size, NUM_CHANNELS), dtype=jnp.float32
+        )
+
+        def place_object(obs, coords, channel):
+            """Place object pixels on the observation grid."""
+
+            def place_pixel(obs, coord):
+                x, y = coord
+                valid = (
+                    (x >= 0) & (y >= 0) & (x < self.grid_size) & (y < self.grid_size)
+                )
+                obs = jax.lax.cond(
+                    valid, lambda o: o.at[y, x, channel].set(1.0), lambda o: o, obs
+                )
+                return obs, None
+
+            obs, _ = jax.lax.scan(place_pixel, obs, coords)
+            return obs
+
+        # Place all objects
+        obs = place_object(obs, state.agent_pos, CHANNEL_AGENT)
+        obs = place_object(obs, state.m1_pos, CHANNEL_M1)
+        obs = place_object(obs, state.m2_pos, CHANNEL_M2)
+        obs = place_object(obs, state.m3_pos, CHANNEL_M3)
+        obs = place_object(obs, state.m4_pos, CHANNEL_M4)
+        obs = place_object(obs, state.g1_pos, CHANNEL_G1)
+        obs = place_object(obs, state.g2_pos, CHANNEL_G2)
+
+        # Place walls from wall_map
+        obs = obs.at[:, :, CHANNEL_WALL].set(state.wall_map.astype(jnp.float32))
+
+        return Observation(image=obs)
 
     def is_terminal(self, state: EnvState, params: EnvParams) -> bool:
         """Check whether state is terminal."""
         done_steps = state.time >= params.max_steps_in_episode
         return jnp.logical_or(done_steps, state.terminal)
-        
-    def _get_full_obs(self, state: EnvState) -> Observation:
-        """Return coomplete grid view"""
-        padding = self.agent_view_size-1
-        obs = jax.lax.dynamic_slice(state.maze_map, (padding, padding, 0), (self.max_height, self.max_width, 3))
-        obs = obs.at[state.agent_pos[1], state.agent_pos[0]].set(
-            jnp.array([OBJECT_TO_INDEX['agent'], COLOR_TO_INDEX['red'], state.agent_dir], dtype=jnp.uint8)
+
+    def _step_agent(self, state: EnvState, action: int) -> EnvState:
+        """Execute action and return new state using wave-front push mechanics."""
+        displacement = DISPLACEMENTS[action]
+        return self._move_with_push(state, displacement)
+
+    def _move_with_push(self, state: EnvState, displacement: chex.Array) -> EnvState:
+        """Execute movement with wave-front collision detection for chain pushes."""
+        # Stack all movable object coordinates
+        coords = jnp.stack(
+            [
+                state.agent_pos,
+                state.m1_pos,
+                state.m2_pos,
+                state.m3_pos,
+                state.m4_pos,
+            ],
+            axis=0,
+        )  # Shape: (5, MAX_PIXELS, 2)
+
+        N = coords.shape[0]
+
+        # Compute displaced positions for all objects
+        all_disp, all_valid = jax.vmap(
+            lambda c: self._masked_displacement(c, displacement)
+        )(coords)
+        # all_disp: (5, MAX_PIXELS, 2)
+        # all_valid: (5, MAX_PIXELS)
+
+        # Initialize wavefront with only agent
+        frontier = jnp.array([True, False, False, False, False])
+        pushed = jnp.zeros((N,), dtype=jnp.bool_).at[0].set(True)
+        broken = jnp.array(False)
+
+        def cond_fn(carry):
+            frontier, pushed, broken = carry
+            return frontier.any()
+
+        def body_fn(carry):
+            frontier, pushed, broken = carry
+
+            # Check for wall/OOB collisions for objects in frontier
+            blocked = self._check_blocked(all_disp, all_valid, state.wall_map)
+            blocked_any = jnp.any(blocked & frontier)
+            broken = broken | blocked_any
+
+            # Compute collision graph between displaced and stationary objects
+            coll_mat = self._compute_collisions(all_disp, all_valid, coords)
+
+            # Find neighbors hit by frontier objects
+            frontier_mat = frontier[:, None]
+            neighbors = jnp.any(coll_mat * frontier_mat, axis=0)
+
+            # New frontier: hit neighbors we haven't pushed yet
+            new_frontier = neighbors & (~pushed)
+            pushed = pushed | new_frontier
+
+            # If blocked, clear frontier
+            frontier = jnp.where(blocked_any, jnp.zeros_like(frontier), new_frontier)
+
+            return frontier, pushed, broken
+
+        # Run wavefront propagation
+        _, final_pushed, final_broken = lax.while_loop(
+            cond_fn, body_fn, (frontier, pushed, broken)
         )
-        image = obs.astype(jnp.uint8)
-        if self.normalize_obs:
-            image = image/10.0
-        return Observation(image=image, agent_dir=state.agent_dir)
-        
-    def _get_partial_obs(self, state: EnvState) -> Observation:
-        """Return limited grid view ahead of agent."""
-        dir_vec = DIR_TO_VEC[state.agent_dir]
-        
-        obs_fwd_bound1 = state.agent_pos
-        obs_fwd_bound2 = state.agent_pos + dir_vec*(self.agent_view_size-1)
 
-        side_offset = self.agent_view_size//2
-        obs_side_bound1 = state.agent_pos + (dir_vec == 0)*side_offset
-        obs_side_bound2 = state.agent_pos - (dir_vec == 0)*side_offset
+        # Agent moved successfully if it was pushed and we didn't break
+        moved_ok = final_pushed[0] & (~final_broken)
 
-        all_bounds = jnp.stack([obs_fwd_bound1, obs_fwd_bound2, obs_side_bound1, obs_side_bound2])
+        def do_push(st):
+            # Apply displacement to all pushed objects
+            should_move = final_pushed[:, None, None]  # (5, 1, 1)
+            moved = jnp.where(should_move, all_disp, coords)
 
-        # Clip obs to grid bounds appropriately
-        padding = self.agent_view_size-1
-        xmin, ymin = jnp.min(all_bounds, 0) + padding
-        obs = jax.lax.dynamic_slice(state.maze_map, (ymin, xmin, 0), (self.agent_view_size, self.agent_view_size, 3))
-
-        obs = (state.agent_dir == 0)*jnp.rot90(obs, 1) + \
-              (state.agent_dir == 1)*jnp.rot90(obs, 2) + \
-              (state.agent_dir == 2)*jnp.rot90(obs, 3) + \
-              (state.agent_dir == 3)*jnp.rot90(obs, 4)
-
-        if self.see_agent:
-            obs = obs.at[-1, side_offset].set(
-                jnp.array([OBJECT_TO_INDEX['agent'], COLOR_TO_INDEX['red'], state.agent_dir], dtype=jnp.uint8)
+            return st.replace(
+                agent_pos=moved[0],
+                m1_pos=moved[1],
+                m2_pos=moved[2],
+                m3_pos=moved[3],
+                m4_pos=moved[4],
             )
 
-        image = obs.astype(jnp.uint8)
-        if self.normalize_obs:
-            image = image/10.0
+        return lax.cond(moved_ok, do_push, lambda st: st, state)
 
-        return Observation(image=image.transpose(1, 0, 2), agent_dir=state.agent_dir)
-        
-    def _step_agent(self, rng: chex.PRNGKey, state: EnvState, action: int, params: EnvParams) -> Tuple[EnvState, float]:
-        # Update agent position (forward action)
-        fwd_pos = jnp.minimum(
-            jnp.maximum(state.agent_pos + (action == Actions.forward)*DIR_TO_VEC[state.agent_dir], 0), 
-            jnp.array([self.max_width-1, self.max_height-1], dtype=jnp.uint32)
+    def _masked_displacement(
+        self,
+        coords: chex.Array,  # (MAX_PIXELS, 2)
+        displacement: chex.Array,  # (2,)
+    ) -> Tuple[chex.Array, chex.Array]:
+        """Compute displaced coordinates, respecting -1 padding."""
+        valid = (coords[:, 0] >= 0) & (coords[:, 1] >= 0)
+        disp_all = coords + displacement
+        disp = jnp.where(valid[:, None], disp_all, coords)
+        return disp, valid
+
+    def _check_blocked(
+        self,
+        all_disp: chex.Array,  # (N, MAX_PIXELS, 2)
+        all_valid: chex.Array,  # (N, MAX_PIXELS)
+        wall_map: chex.Array,  # (GRID_SIZE, GRID_SIZE)
+    ) -> chex.Array:
+        """Check which objects hit walls or go out of bounds."""
+        xs = all_disp[..., 0]
+        ys = all_disp[..., 1]
+
+        # Clamp to valid indices for wall lookup
+        xs_clamped = jnp.clip(xs, 0, self.grid_size - 1)
+        ys_clamped = jnp.clip(ys, 0, self.grid_size - 1)
+
+        # Check walls
+        raw_vals = wall_map[ys_clamped, xs_clamped]
+        wall_vals = jnp.where(all_valid, raw_vals, False)
+        hit_wall = jnp.any(wall_vals, axis=1)
+
+        # Check out of bounds
+        in_bounds = (
+            (xs >= 0) & (xs < self.grid_size) & (ys >= 0) & (ys < self.grid_size)
         )
+        valid_in_bounds = jnp.where(all_valid, in_bounds, True)
+        oob = ~jnp.all(valid_in_bounds, axis=1)
 
-        # Can't go past wall or goal
-        fwd_pos_has_wall = state.wall_map[fwd_pos[1], fwd_pos[0]]
-        fwd_pos_has_goal = jnp.logical_and(fwd_pos[0] == state.goal_pos[0], fwd_pos[1] == state.goal_pos[1])
-        fwd_pos_blocked = jnp.logical_or(fwd_pos_has_wall, fwd_pos_has_goal)
-        agent_pos = (fwd_pos_blocked*state.agent_pos + (~fwd_pos_blocked)*fwd_pos).astype(jnp.uint32)
+        return hit_wall | oob
 
-        # Update agent direction (left_turn or right_turn action)
-        agent_dir_offset = 0 + (action == Actions.right) - (action == Actions.left)
-        agent_dir = (state.agent_dir + agent_dir_offset) % 4
+    def _compute_collisions(
+        self,
+        all_disp: chex.Array,  # (N, MAX_PIXELS, 2)
+        all_valid: chex.Array,  # (N, MAX_PIXELS)
+        coords: chex.Array,  # (N, MAX_PIXELS, 2)
+    ) -> chex.Array:
+        """Compute collision matrix between displaced and stationary objects."""
+        # Compare all pixel combinations
+        # all_disp[i, p_i] vs coords[j, p_j]
+        eq = all_disp[:, :, None, None, :] == coords[None, None, :, :, :]
+        # eq: (N, MAX_PIXELS, N, MAX_PIXELS, 2)
 
+        pixel_eq = jnp.all(eq, axis=-1)  # Both x and y match
+
+        # Mask invalid pixels
+        valid_i = all_valid[:, :, None, None]
+        valid_j = all_valid[None, None, :, :]
+        valid_collision = pixel_eq & valid_i & valid_j
+
+        # Reduce to object-level collision matrix
+        coll_mat = jnp.any(valid_collision, axis=(1, 3))  # (N, N)
+
+        return coll_mat
+
+    def _check_goal(self, obs: Observation) -> chex.Array:
+        """Check if all goals are satisfied (movable covers goal exactly)."""
+        # M1 should cover G1, M2 should cover G2
+        m1_channel = obs.image[:, :, CHANNEL_M1]
+        g1_channel = obs.image[:, :, CHANNEL_G1]
+        m2_channel = obs.image[:, :, CHANNEL_M2]
+        g2_channel = obs.image[:, :, CHANNEL_G2]
+
+        # Check if goal exists
+        g1_exists = jnp.any(g1_channel > 0)
+        g2_exists = jnp.any(g2_channel > 0)
+
+        # Check if movable covers goal exactly
+        m1_on_g1 = jnp.all(m1_channel == g1_channel)
+        m2_on_g2 = jnp.all(m2_channel == g2_channel)
+
+        # Goal is reached if all existing goals are covered
+        g1_satisfied = (~g1_exists) | (g1_exists & m1_on_g1)
+        g2_satisfied = (~g2_exists) | (g2_exists & m2_on_g2)
+
+        # At least one goal must exist and be satisfied
+        has_any_goal = g1_exists | g2_exists
+        all_goals_satisfied = g1_satisfied & g2_satisfied
+
+        return has_any_goal & all_goals_satisfied
+
+    def _num_goals_reached(self, obs: Observation) -> chex.Array:
+        """Count how many goals are currently satisfied."""
+        m1_channel = obs.image[:, :, CHANNEL_M1]
+        g1_channel = obs.image[:, :, CHANNEL_G1]
+        m2_channel = obs.image[:, :, CHANNEL_M2]
+        g2_channel = obs.image[:, :, CHANNEL_G2]
+
+        g1_exists = jnp.any(g1_channel > 0)
+        g2_exists = jnp.any(g2_channel > 0)
+
+        m1_on_g1 = jnp.all(m1_channel == g1_channel)
+        m2_on_g2 = jnp.all(m2_channel == g2_channel)
+
+        count = jnp.array(0)
+        count = count + jax.lax.select(g1_exists & m1_on_g1, 1, 0)
+        count = count + jax.lax.select(g2_exists & m2_on_g2, 1, 0)
+
+        return count
+
+    def _compute_reward(
+        self,
+        prev_obs: Observation,
+        obs: Observation,
+        goal_reached: chex.Array,
+        state: EnvState,
+        params: EnvParams,
+    ) -> chex.Array:
+        """Compute reward for the transition."""
+        # Base reward for reaching goal
+        reward = jax.lax.select(goal_reached, SUCCESS_REWARD, 0.0)
+
+        # Reward shaping for goal progress
+        if self.reward_shaping and prev_obs is not None:
+            prev_goals = self._num_goals_reached(prev_obs)
+            curr_goals = self._num_goals_reached(obs)
+            progress = (curr_goals - prev_goals).astype(jnp.float32)
+            reward = reward + progress * GOAL_PROGRESS_REWARD
+
+        # Time penalty
         if self.penalize_time:
-            reward = (1.0 - 0.9*((state.time+1)/params.max_steps_in_episode))*fwd_pos_has_goal
-        else:
-            reward = jax.lax.select(fwd_pos_has_goal, 1., 0.)
+            reward = reward + STEP_REWARD
 
-        return (
-            state.replace(
-                agent_pos=agent_pos,
-                agent_dir=agent_dir,  
-                terminal=fwd_pos_has_goal),
-            reward
-        )
-        
-def make_maze_map(
-    level: Level,
-    padding=0,
-    ignore_goal=False,
-) -> chex.Array:
-    """This function is used internally in this class, and it creates a single array map of the entire level. This includes walls, the goal but not the agent.
-
-    Args:
-        level (Level): 
-        padding (int, optional): How much to pad the level with, which is used to ensure the agent's observations when it is near the edge is well-defined. Defaults to 0.
-        ignore_goal (bool, optional): If true, the observation does not contain the goal. Defaults to False.
-
-    Returns:
-        chex.Array: The full maze map.
-    """
-    # Expand maze map to H x W x C
-    empty = jnp.array([OBJECT_TO_INDEX['empty'], 0, 0], dtype=jnp.uint8)
-    wall = jnp.array([OBJECT_TO_INDEX['wall'], COLOR_TO_INDEX['grey'], 0], dtype=jnp.uint8)
-    maze_map = jnp.array(jnp.expand_dims(level.wall_map, -1), dtype=jnp.uint8)
-    maze_map = jnp.where(maze_map > 0, wall, empty)
-
-    goal = jnp.array([OBJECT_TO_INDEX['goal'], COLOR_TO_INDEX['green'], 0], dtype=jnp.uint8)
-    goal_x,goal_y = level.goal_pos
-    maze_map = jax.lax.select(ignore_goal, maze_map, maze_map.at[goal_y,goal_x,:].set(goal))
-
-    if padding > 0:
-        maze_map_padded = jnp.tile(wall.reshape((1, 1, *empty.shape)), (maze_map.shape[0]+2*padding, maze_map.shape[1]+2*padding, 1))
-        maze_map_padded = maze_map_padded.at[padding:-padding,padding:-padding,:].set(maze_map)
-
-        # Add surrounding walls
-        wall_start = padding-1 # start index for walls
-        wall_end_y = maze_map_padded.shape[0] - wall_start - 1
-        wall_end_x = maze_map_padded.shape[1] - wall_start - 1
-        maze_map_padded = maze_map_padded.at[wall_start,wall_start:wall_end_x+1,:].set(wall) # top
-        maze_map_padded = maze_map_padded.at[wall_end_y,wall_start:wall_end_x+1,:].set(wall) # bottom
-        maze_map_padded = maze_map_padded.at[wall_start:wall_end_y+1,wall_start,:].set(wall) # left
-        maze_map_padded = maze_map_padded.at[wall_start:wall_end_y+1,wall_end_x,:].set(wall) # right
-
-        return maze_map_padded
-    else:
-        return maze_map
+        return reward.astype(jnp.float32)

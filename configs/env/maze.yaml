@@ -1,0 +1,7 @@
+# Maze environment configuration
+env_name: maze
+max_height: 13
+max_width: 13
+agent_view_size: 5
+normalize_obs: true
+n_walls: 25

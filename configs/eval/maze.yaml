@@ -1,0 +1,12 @@
+# Maze evaluation settings
+eval_freq: 250
+eval_num_attempts: 10
+eval_levels:
+  - SixteenRooms
+  - SixteenRooms2
+  - Labyrinth
+  - LabyrinthFlipped
+  - Labyrinth2
+  - StandardMaze
+  - StandardMaze2
+  - StandardMaze3

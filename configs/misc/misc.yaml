@@ -1,0 +1,13 @@
+# Miscellaneous settings
+seed: 0
+use_wandb: true
+wandb_project: JAXUED_TEST
+wandb_entity: null
+wandb_mode: online
+save_path: checkpoints
+save_policy: true
+checkpoint_save_interval: 2
+max_number_of_checkpoints: 60
+mode: train  # train or eval
+checkpoint_directory: null
+checkpoint_to_eval: -1

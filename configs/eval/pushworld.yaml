@@ -1,0 +1,12 @@
+# PushWorld evaluation settings
+eval_freq: 250
+eval_num_attempts: 10
+eval_levels:
+  - TrivialPush
+  - SimplePush
+  - TwoGoals
+  - ChainPush
+  - WallMaze
+  - Test131
+  - Test22
+  - Test23

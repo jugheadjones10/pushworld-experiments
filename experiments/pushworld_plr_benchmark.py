@@ -1,19 +1,19 @@
 """
-PushWorld PLR Training with Hydra Configuration.
+PushWorld PLR Training with Benchmark Puzzles.
 
 This script trains an RL agent on PushWorld puzzle environments using PLR
-(Prioritized Level Replay) or ACCEL for curriculum learning.
+(Prioritized Level Replay) with a FIXED BENCHMARK of puzzles instead of 
+randomly generating levels.
 
-The PushWorld environment features:
-- 10x10 grid with polyomino objects
-- 4 movable objects, 2 goals
-- Wave-front collision detection for chain pushing
-- Full observation (8-channel grid)
+Key difference from pushworld_plr.py:
+- Uses a pre-loaded benchmark of puzzles as the training set
+- PLR prioritizes which puzzles from the benchmark to train on
+- No random level generation - all levels come from the benchmark
 
 Usage:
-    python pushworld_plr.py                          # Use default config
-    python pushworld_plr.py ued=accel                # Use ACCEL instead of PLR
-    python pushworld_plr.py seed=42 num_updates=1000 # Override parameters
+    python pushworld_plr_benchmark.py                              # Use default config
+    python pushworld_plr_benchmark.py benchmark_path=/path/to.pkl  # Use custom benchmark
+    python pushworld_plr_benchmark.py seed=42 num_updates=1000     # Override parameters
 """
 
 import json
@@ -45,8 +45,7 @@ from jaxued.environments.pushworld import (
     Observation,
     PushWorld,
     PushWorldRenderer,
-    make_level_generator,
-    make_level_mutator_minimax,
+    Benchmark,
 )
 from jaxued.environments.underspecified_env import UnderspecifiedEnv
 from jaxued.level_sampler import LevelSampler
@@ -81,19 +80,7 @@ def compute_gae(
     rewards: chex.Array,
     dones: chex.Array,
 ) -> Tuple[chex.Array, chex.Array]:
-    """Compute Generalized Advantage Estimation.
-
-    Args:
-        gamma: Discount factor
-        lambd: GAE lambda parameter
-        last_value: Value of last state, shape (NUM_ENVS,)
-        values: Values for each step, shape (NUM_STEPS, NUM_ENVS)
-        rewards: Rewards for each step, shape (NUM_STEPS, NUM_ENVS)
-        dones: Done flags for each step, shape (NUM_STEPS, NUM_ENVS)
-
-    Returns:
-        Tuple of (advantages, targets), each shape (NUM_STEPS, NUM_ENVS)
-    """
+    """Compute Generalized Advantage Estimation."""
 
     def compute_gae_at_timestep(carry, x):
         gae, next_value = carry
@@ -323,20 +310,13 @@ def update_actor_critic_rnn(
 
 
 class PushWorldActorCritic(nn.Module):
-    """Actor-Critic network for PushWorld environment.
-
-    Uses a CNN to process the 8-channel grid observation,
-    followed by an LSTM for temporal reasoning.
-    """
+    """Actor-Critic network for PushWorld environment."""
 
     action_dim: Sequence[int]
 
     @nn.compact
     def __call__(self, inputs, hidden):
         obs, dones = inputs
-
-        # PushWorld observation is (H, W, 8) - process with CNN
-        # obs.image shape: (batch_dims..., 10, 10, 8)
         img = obs.image
 
         # CNN embedding
@@ -346,9 +326,9 @@ class PushWorldActorCritic(nn.Module):
             img_embed
         )
         img_embed = nn.relu(img_embed)
-        img_embed = img_embed.reshape(*img_embed.shape[:-3], -1)  # Flatten spatial dims
+        img_embed = img_embed.reshape(*img_embed.shape[:-3], -1)
 
-        # Dense layer to reduce dimensionality
+        # Dense layer
         embedding = nn.Dense(
             256,
             kernel_init=orthogonal(np.sqrt(2)),
@@ -357,7 +337,7 @@ class PushWorldActorCritic(nn.Module):
         )(img_embed)
         embedding = nn.relu(embedding)
 
-        # LSTM for temporal processing
+        # LSTM
         hidden, embedding = ResetRNN(nn.OptimizedLSTMCell(features=256))(
             (embedding, dones), initial_carry=hidden
         )
@@ -406,7 +386,6 @@ def setup_checkpointing(
     )
     os.makedirs(overall_save_dir, exist_ok=True)
 
-    # save the config
     with open(os.path.join(overall_save_dir, "config.json"), "w+") as f:
         f.write(json.dumps(config, indent=True))
 
@@ -458,7 +437,7 @@ def compute_score(config, dones, values, max_returns, advantages):
         raise ValueError(f"Unknown score function: {config['score_function']}")
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="pushworld_plr")
+@hydra.main(version_base=None, config_path="../configs", config_name="pushworld_plr_benchmark")
 def main(cfg: DictConfig):
     # Convert OmegaConf to dict for compatibility
     config = OmegaConf.to_container(cfg, resolve=True)
@@ -467,10 +446,7 @@ def main(cfg: DictConfig):
     tags = []
     if not config["exploratory_grad_updates"]:
         tags.append("robust")
-    if config["use_accel"]:
-        tags.append("ACCEL")
-    else:
-        tags.append("PLR")
+    tags.append("PLR-benchmark")
     tags.append("pushworld")
 
     # Initialize wandb
@@ -496,7 +472,6 @@ def main(cfg: DictConfig):
     def log_eval(stats, train_state_info):
         print(f"Logging update: {stats['update_count']}")
 
-        # generic stats
         env_steps = (
             stats["update_count"] * config["num_train_envs"] * config["num_steps"]
         )
@@ -506,7 +481,6 @@ def main(cfg: DictConfig):
             "sps": env_steps / stats["time_delta"],
         }
 
-        # evaluation performance
         solve_rates = stats["eval_solve_rates"]
         returns = stats["eval_returns"]
         log_dict.update(
@@ -522,10 +496,8 @@ def main(cfg: DictConfig):
         log_dict.update({"return/mean": returns.mean()})
         log_dict.update({"eval_ep_lengths/mean": stats["eval_ep_lengths"].mean()})
 
-        # level sampler
         log_dict.update(train_state_info["log"])
 
-        # images
         log_dict.update(
             {
                 "images/highest_scoring_level": wandb.Image(
@@ -554,7 +526,6 @@ def main(cfg: DictConfig):
                     }
                 )
 
-        # animations
         for i, level_name in enumerate(config["eval_levels"]):
             frames, episode_length = (
                 stats["eval_animation"][0][:, i],
@@ -566,20 +537,37 @@ def main(cfg: DictConfig):
         if config["use_wandb"]:
             wandb.log(log_dict)
 
+    # =========================================================================
+    # LOAD BENCHMARK - This is the key difference from pushworld_plr.py!
+    # =========================================================================
+    benchmark_name = config.get("benchmark_name")
+    benchmark_path = config.get("benchmark_path")
+    
+    if benchmark_name:
+        # Load by name (auto-downloads from HuggingFace if needed)
+        print(f"Loading benchmark by name: {benchmark_name}")
+        benchmark = Benchmark.load(benchmark_name)
+    elif benchmark_path:
+        # Load from explicit path
+        print(f"Loading benchmark from path: {benchmark_path}")
+        benchmark = Benchmark.load_from_path(benchmark_path)
+    else:
+        raise ValueError("Must specify either 'benchmark_name' or 'benchmark_path' in config")
+    num_train_puzzles = benchmark.num_train_puzzles()
+    num_test_puzzles = benchmark.num_test_puzzles()
+    print(f"Loaded benchmark with {num_train_puzzles} train puzzles and {num_test_puzzles} test puzzles")
+
+    # Create a function that samples from the benchmark
+    def sample_level_from_benchmark(key: chex.PRNGKey) -> Level:
+        """Sample a random level from the benchmark."""
+        return benchmark.sample_puzzle(key, puzzle_type="train")
+
     # Setup the PushWorld environment
     env = PushWorld(
         penalize_time=config["penalize_time"],
         reward_shaping=config["reward_shaping"],
     )
     eval_env = env
-
-    # Create level generator and mutator
-    sample_random_level = make_level_generator(
-        height=config["grid_size"],
-        width=config["grid_size"],
-        n_walls=config["n_walls"],
-        n_movables=config["n_movables"],
-    )
 
     # Create renderer for visualization
     env_renderer = PushWorldRenderer(env, tile_size=8, render_grid_lines=False)
@@ -588,26 +576,24 @@ def main(cfg: DictConfig):
     env = AutoReplayWrapper(env)
     env_params = EnvParams(max_steps_in_episode=config["max_steps_in_episode"])
 
-    # Create level mutator
-    mutate_level = make_level_mutator_minimax(100)
-
-    # And the level sampler
+    # Level sampler - we set capacity to num_train_puzzles since we have a fixed set
+    # We'll fill the buffer with ALL training puzzles upfront
     level_sampler = LevelSampler(
-        capacity=config["level_buffer_capacity"],
+        capacity=num_train_puzzles,  # Buffer size = number of training puzzles
         replay_prob=config["replay_prob"],
         staleness_coeff=config["staleness_coeff"],
-        minimum_fill_ratio=config["minimum_fill_ratio"],
+        minimum_fill_ratio=0.0,  # Start replaying immediately since we pre-fill
         prioritization=config["prioritization"],
         prioritization_params={
             "temperature": config["temperature"],
             "k": config["topk_k"],
         },
-        duplicate_check=config["buffer_duplicate_check"],
+        duplicate_check=False,  # No duplicates since we load fixed puzzles
     )
 
     @jax.jit
     def create_train_state(rng) -> TrainState:
-        # Creates the train state
+        """Creates the train state with pre-filled level buffer."""
         def linear_schedule(count):
             frac = (
                 1.0
@@ -616,7 +602,10 @@ def main(cfg: DictConfig):
             )
             return config["lr"] * frac
 
-        obs, _ = env.reset_to_level(rng, sample_random_level(rng), env_params)
+        # Sample a puzzle for network initialization
+        rng, rng_level = jax.random.split(rng)
+        sample_level = sample_level_from_benchmark(rng_level)
+        obs, _ = env.reset_to_level(rng, sample_level, env_params)
         obs = jax.tree_util.tree_map(
             lambda x: jnp.repeat(
                 jnp.repeat(x[None, ...], config["num_train_envs"], axis=0)[None, ...],
@@ -627,7 +616,7 @@ def main(cfg: DictConfig):
         )
         init_x = (obs, jnp.zeros((256, config["num_train_envs"])))
 
-        # Use PushWorld-specific actor-critic with 4 actions
+        # Initialize network
         network = PushWorldActorCritic(len(Actions))
         network_params = network.init(
             rng,
@@ -638,8 +627,19 @@ def main(cfg: DictConfig):
             optax.clip_by_global_norm(config["max_grad_norm"]),
             optax.adam(learning_rate=linear_schedule, eps=1e-5),
         )
-        pholder_level = sample_random_level(jax.random.PRNGKey(0))
+
+        # Initialize sampler with a placeholder
+        pholder_level = sample_level_from_benchmark(jax.random.PRNGKey(0))
         sampler = level_sampler.initialize(pholder_level, {"max_return": -jnp.inf})
+
+        # Pre-fill the buffer with ALL training puzzles
+        all_train_levels = benchmark.get_all_train_puzzles()
+        initial_scores = jnp.zeros(num_train_puzzles)  # Start with equal scores
+        initial_max_returns = jnp.full(num_train_puzzles, -jnp.inf)
+        sampler, _ = level_sampler.insert_batch(
+            sampler, all_train_levels, initial_scores, {"max_return": initial_max_returns}
+        )
+
         pholder_level_batch = jax.tree_util.tree_map(
             lambda x: jnp.array([x]).repeat(config["num_train_envs"], axis=0),
             pholder_level,
@@ -659,94 +659,28 @@ def main(cfg: DictConfig):
         )
 
     def train_step(carry: Tuple[chex.PRNGKey, TrainState], _):
-        """Main training loop - calls on_new_levels, on_replay_levels, or on_mutate_levels."""
-
-        def on_new_levels(rng: chex.PRNGKey, train_state: TrainState):
-            """Sample new random levels and evaluate/update policy."""
-            sampler = train_state.sampler
-
-            # Reset
-            rng, rng_levels, rng_reset = jax.random.split(rng, 3)
-            new_levels = jax.vmap(sample_random_level)(
-                jax.random.split(rng_levels, config["num_train_envs"])
-            )
-            init_obs, init_env_state = jax.vmap(
-                env.reset_to_level, in_axes=(0, 0, None)
-            )(
-                jax.random.split(rng_reset, config["num_train_envs"]),
-                new_levels,
-                env_params,
-            )
-
-            # Rollout
-            (
-                (rng, train_state, hstate, last_obs, last_env_state, last_value),
-                (obs, actions, rewards, dones, log_probs, values, info),
-            ) = sample_trajectories_rnn(
-                rng,
-                env,
-                env_params,
-                train_state,
-                PushWorldActorCritic.initialize_carry((config["num_train_envs"],)),
-                init_obs,
-                init_env_state,
-                config["num_train_envs"],
-                config["num_steps"],
-            )
-            advantages, targets = compute_gae(
-                config["gamma"],
-                config["gae_lambda"],
-                last_value,
-                values,
-                rewards,
-                dones,
-            )
-            max_returns = compute_max_returns(dones, rewards)
-            scores = compute_score(config, dones, values, max_returns, advantages)
-            sampler, _ = level_sampler.insert_batch(
-                sampler, new_levels, scores, {"max_return": max_returns}
-            )
-
-            # Update: train_state only modified if exploratory_grad_updates is on
-            (rng, train_state), losses = update_actor_critic_rnn(
-                rng,
-                train_state,
-                PushWorldActorCritic.initialize_carry((config["num_train_envs"],)),
-                (obs, actions, dones, log_probs, values, targets, advantages),
-                config["num_train_envs"],
-                config["num_steps"],
-                config["num_minibatches"],
-                config["epoch_ppo"],
-                config["clip_eps"],
-                config["entropy_coeff"],
-                config["critic_coeff"],
-                update_grad=config["exploratory_grad_updates"],
-            )
-            metrics = {
-                "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
-                "mean_num_walls": new_levels.wall_map.sum() / config["num_train_envs"],
-            }
-
-            train_state = train_state.replace(
-                sampler=sampler,
-                update_state=UpdateState.DR,
-                num_dr_updates=train_state.num_dr_updates + 1,
-                dr_last_level_batch=new_levels,
-            )
-            return (rng, train_state), metrics
+        """Main training step - always replays from the benchmark buffer."""
 
         def on_replay_levels(rng: chex.PRNGKey, train_state: TrainState):
-            """Sample levels from buffer and update policy."""
+            """Sample levels from buffer and update policy.
+            
+            Since we use a fixed benchmark, this is the ONLY update type.
+            We always sample from the pre-filled buffer.
+            """
             sampler = train_state.sampler
 
-            # Collect trajectories on replay levels
+            # Sample levels from buffer (weighted by PLR scores)
             rng, rng_levels, rng_reset = jax.random.split(rng, 3)
             sampler, (level_inds, levels) = level_sampler.sample_replay_levels(
                 sampler, rng_levels, config["num_train_envs"]
             )
+
+            # Reset environments to sampled levels
             init_obs, init_env_state = jax.vmap(
                 env.reset_to_level, in_axes=(0, 0, None)
             )(jax.random.split(rng_reset, config["num_train_envs"]), levels, env_params)
+
+            # Collect trajectories
             (
                 (rng, train_state, hstate, last_obs, last_env_state, last_value),
                 (obs, actions, rewards, dones, log_probs, values, info),
@@ -761,6 +695,8 @@ def main(cfg: DictConfig):
                 config["num_train_envs"],
                 config["num_steps"],
             )
+
+            # Compute advantages and update scores
             advantages, targets = compute_gae(
                 config["gamma"],
                 config["gae_lambda"],
@@ -774,11 +710,13 @@ def main(cfg: DictConfig):
                 compute_max_returns(dones, rewards),
             )
             scores = compute_score(config, dones, values, max_returns, advantages)
+
+            # Update scores in buffer
             sampler = level_sampler.update_batch(
                 sampler, level_inds, scores, {"max_return": max_returns}
             )
 
-            # Update the policy using trajectories collected from replay levels
+            # Update the policy
             (rng, train_state), losses = update_actor_critic_rnn(
                 rng,
                 train_state,
@@ -807,109 +745,9 @@ def main(cfg: DictConfig):
             )
             return (rng, train_state), metrics
 
-        def on_mutate_levels(rng: chex.PRNGKey, train_state: TrainState):
-            """Mutate previous replay levels and potentially add to buffer."""
-            sampler = train_state.sampler
-            rng, rng_mutate, rng_reset = jax.random.split(rng, 3)
-
-            # mutate
-            parent_levels = train_state.replay_last_level_batch
-            child_levels = jax.vmap(mutate_level, (0, 0, None))(
-                jax.random.split(rng_mutate, config["num_train_envs"]),
-                parent_levels,
-                config["num_edits"],
-            )
-            init_obs, init_env_state = jax.vmap(
-                env.reset_to_level, in_axes=(0, 0, None)
-            )(
-                jax.random.split(rng_reset, config["num_train_envs"]),
-                child_levels,
-                env_params,
-            )
-
-            # rollout
-            (
-                (rng, train_state, hstate, last_obs, last_env_state, last_value),
-                (obs, actions, rewards, dones, log_probs, values, info),
-            ) = sample_trajectories_rnn(
-                rng,
-                env,
-                env_params,
-                train_state,
-                PushWorldActorCritic.initialize_carry((config["num_train_envs"],)),
-                init_obs,
-                init_env_state,
-                config["num_train_envs"],
-                config["num_steps"],
-            )
-            advantages, targets = compute_gae(
-                config["gamma"],
-                config["gae_lambda"],
-                last_value,
-                values,
-                rewards,
-                dones,
-            )
-            max_returns = compute_max_returns(dones, rewards)
-            scores = compute_score(config, dones, values, max_returns, advantages)
-            sampler, _ = level_sampler.insert_batch(
-                sampler, child_levels, scores, {"max_return": max_returns}
-            )
-
-            # Update: train_state only modified if exploratory_grad_updates is on
-            (rng, train_state), losses = update_actor_critic_rnn(
-                rng,
-                train_state,
-                PushWorldActorCritic.initialize_carry((config["num_train_envs"],)),
-                (obs, actions, dones, log_probs, values, targets, advantages),
-                config["num_train_envs"],
-                config["num_steps"],
-                config["num_minibatches"],
-                config["epoch_ppo"],
-                config["clip_eps"],
-                config["entropy_coeff"],
-                config["critic_coeff"],
-                update_grad=config["exploratory_grad_updates"],
-            )
-
-            metrics = {
-                "losses": jax.tree_util.tree_map(lambda x: x.mean(), losses),
-                "mean_num_walls": child_levels.wall_map.sum()
-                / config["num_train_envs"],
-            }
-
-            train_state = train_state.replace(
-                sampler=sampler,
-                update_state=UpdateState.DR,
-                num_mutation_updates=train_state.num_mutation_updates + 1,
-                mutation_last_level_batch=child_levels,
-            )
-            return (rng, train_state), metrics
-
         rng, train_state = carry
-        rng, rng_replay = jax.random.split(rng)
-
-        # Decision on which branch to take
-        if config["use_accel"]:
-            s = train_state.update_state
-            branch = (1 - s) * level_sampler.sample_replay_decision(
-                train_state.sampler, rng_replay
-            ) + 2 * s
-        else:
-            branch = level_sampler.sample_replay_decision(
-                train_state.sampler, rng_replay
-            ).astype(int)
-
-        return jax.lax.switch(
-            branch,
-            [
-                on_new_levels,
-                on_replay_levels,
-                on_mutate_levels,
-            ],
-            rng,
-            train_state,
-        )
+        # Always do replay since we have a fixed benchmark
+        return on_replay_levels(rng, train_state)
 
     def eval(rng: chex.PRNGKey, train_state: TrainState):
         """Evaluate the current policy on evaluation levels."""
@@ -955,7 +793,6 @@ def main(cfg: DictConfig):
         eval_solve_rates = jnp.where(cum_rewards > 0, 1.0, 0.0).mean(axis=0)
         eval_returns = cum_rewards.mean(axis=0)
 
-        # just grab the first run
         states, episode_lengths = jax.tree_util.tree_map(
             lambda x: x[0], (states, episode_lengths)
         )
@@ -1002,54 +839,14 @@ def main(cfg: DictConfig):
 
         return (rng, train_state), metrics
 
-    def eval_checkpoint(og_config):
-        """Evaluate a saved checkpoint after training."""
-        rng_init, rng_eval = jax.random.split(jax.random.PRNGKey(10000))
-
-        def load(rng_init, checkpoint_directory: str):
-            with open(os.path.join(checkpoint_directory, "config.json")) as f:
-                ckpt_config = json.load(f)
-            checkpoint_manager = ocp.CheckpointManager(
-                os.path.join(os.getcwd(), checkpoint_directory, "models"),
-                item_handlers=ocp.StandardCheckpointHandler(),
-            )
-
-            train_state_og: TrainState = create_train_state(rng_init)
-            step = (
-                checkpoint_manager.latest_step()
-                if og_config["checkpoint_to_eval"] == -1
-                else og_config["checkpoint_to_eval"]
-            )
-
-            loaded_checkpoint = checkpoint_manager.restore(step)
-            params = loaded_checkpoint["params"]
-            train_state = train_state_og.replace(params=params)
-            return train_state, ckpt_config
-
-        train_state, ckpt_config = load(rng_init, og_config["checkpoint_directory"])
-        states, cum_rewards, episode_lengths = jax.vmap(eval, (0, None))(
-            jax.random.split(rng_eval, og_config["eval_num_attempts"]), train_state
-        )
-        save_loc = og_config["checkpoint_directory"].replace("checkpoints", "results")
-        os.makedirs(save_loc, exist_ok=True)
-        np.savez_compressed(
-            os.path.join(save_loc, "results.npz"),
-            states=np.asarray(states),
-            cum_rewards=np.asarray(cum_rewards),
-            episode_lengths=np.asarray(episode_lengths),
-            levels=ckpt_config["eval_levels"],
-        )
-        return states, cum_rewards, episode_lengths
-
-    if config["mode"] == "eval":
-        return eval_checkpoint(config)
-
     # Set up the train states
     rng = jax.random.PRNGKey(config["seed"])
     rng_init, rng_train = jax.random.split(rng)
 
     train_state = create_train_state(rng_init)
     runner_state = (rng_train, train_state)
+
+    print(f"Buffer pre-filled with {train_state.sampler['size']} puzzles")
 
     # And run the train_eval_sep function for the specified number of updates
     if config["checkpoint_save_interval"] > 0:

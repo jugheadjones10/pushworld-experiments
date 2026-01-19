@@ -1,0 +1,35 @@
+# PushWorld PLR Training with Benchmark Puzzles Configuration
+# 
+# This config uses a FIXED BENCHMARK of puzzles instead of random generation.
+# PLR prioritizes which puzzles to train on based on learning signal.
+
+defaults:
+  - learning/ppo
+  - ued/plr
+  - misc/misc
+  - eval/pushworld
+  - _self_
+
+# === BENCHMARK CONFIG ===
+# Option 1: Load by name (auto-downloads from HuggingFace if needed)
+# Available names: 'level0_transformed_all', 'level0_transformed_base', 'level0_mini'
+benchmark_name: level0_transformed_all
+
+# Option 2: Load from explicit path (uncomment to use instead)
+# benchmark_path: /path/to/your/benchmark.pkl
+benchmark_path: null
+
+# === ENVIRONMENT CONFIG ===
+grid_size: 10
+penalize_time: true
+reward_shaping: false
+max_steps_in_episode: 100
+
+# === Override PLR settings for benchmark mode ===
+# Since we have a fixed set of puzzles, we don't need minimum_fill_ratio
+# The buffer is pre-filled with all training puzzles at startup
+replay_prob: 1.0  # Always replay (no DR since we don't generate new levels)
+minimum_fill_ratio: 0.0  # Buffer is pre-filled
+
+# === Run name ===
+run_name: pushworld_plr_benchmark

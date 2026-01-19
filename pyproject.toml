@@ -5,30 +5,36 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pushworld-experiments"
 version = "0.1.0"
-description = "Add your description here"
+description = "PushWorld PLR experiments with JAX"
 readme = "README.md"
 requires-python = ">=3.9"
 
 dependencies = [
     "numpy",
     "jax",
+    "jaxlib",
     "flax",
     "chex",
     "gymnax",
-]
-
-[project.optional-dependencies]
-experiments = [
     "distrax",
     "optax",
-    "orbax-checkpoint==0.5.3",
-    "orbax",
+    "orbax-checkpoint",
     "wandb",
     "pillow",
     "imageio",
-    "moviepy"
+    "hydra-core",
+    "omegaconf",
+    "pygame",
+    "matplotlib",
+    "tqdm",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "ipykernel",
+    "ipython",
+    "moviepy",
+]
 
 [tool.setuptools.packages.find]
 include = ["jaxued*"]

@@ -1,200 +1,359 @@
-import jax
-import jax.numpy as jnp
-import chex
-from .level import Level
-from .env import DIR_TO_VEC
+"""
+Utility functions for PushWorld level generation and mutation.
+
+These functions are used by PLR (Prioritized Level Replay) for
+generating and mutating levels during training.
+"""
+
 from enum import IntEnum
-import numpy as np
 from typing import Callable
 
-def make_level_generator(height: int, width: int, n_walls: int) -> Callable[[chex.PRNGKey], Level]:
-    """This takes in a height, width and number of walls and returns a function that takes in a PRNGKey and returns a level.
+import chex
+import jax
+import jax.numpy as jnp
+
+from .level import GRID_SIZE, MAX_PIXELS, Level
+
+
+def make_level_generator(
+    height: int = GRID_SIZE,
+    width: int = GRID_SIZE,
+    n_walls: int = 10,
+    n_movables: int = 1,
+) -> Callable[[chex.PRNGKey], Level]:
+    """Create a function that generates random PushWorld levels.
 
     Args:
-        height (int): 
-        width (int): 
-        n_walls (int): 
+        height: Grid height (default: 10)
+        width: Grid width (default: 10)
+        n_walls: Number of wall cells to place
+        n_movables: Number of movable objects (1-4)
+
+    Returns:
+        Function that takes a PRNGKey and returns a Level
     """
+
     def sample(rng: chex.PRNGKey) -> Level:
         max_w, max_h = width, height
-        all_pos = jnp.arange(max_w * max_h, dtype=jnp.uint32)
-        valid_mask = (all_pos % max_w < width) & (all_pos < max_w * height)
-        
-        rng_wall, rng_agent_pos, rng_agent_dir, rng_goal = jax.random.split(rng, 4)
-        # n_walls = jax.random.choice(rng_n_walls, n_walls+1)
-        
-        choices = jax.random.choice(rng_wall, max_w*max_h, shape=(max_w*max_h,), p=valid_mask, replace=True)
-        choices = jnp.where(all_pos < n_walls, choices, choices[0])
-        occupied_mask = jnp.zeros(max_w * max_h, dtype=jnp.bool_).at[choices].set(n_walls > 0) | ~valid_mask
-        wall_map = occupied_mask.reshape(max_h, max_w)
+        all_pos = jnp.arange(max_w * max_h, dtype=jnp.int32)
 
-        # Reset agent position + dir
-        agent_idx = jax.random.choice(rng_agent_pos, all_pos, shape=(1,), p=(~occupied_mask).astype(jnp.float32))
-        occupied_mask = occupied_mask.at[agent_idx].set(True)
-        agent_pos = jnp.array([agent_idx%max_w, agent_idx//max_w], dtype=jnp.uint32).flatten()
+        rng, rng_wall, rng_agent, rng_m1, rng_m2, rng_g1, rng_g2 = jax.random.split(
+            rng, 7
+        )
 
-        # Reset agent direction
-        agent_dir = jax.random.choice(rng_agent_dir, jnp.arange(len(DIR_TO_VEC), dtype=jnp.uint8))
+        # Initialize empty wall map
+        wall_map = jnp.zeros((max_h, max_w), dtype=jnp.bool_)
+        occupied_mask = jnp.zeros(max_w * max_h, dtype=jnp.bool_)
 
-        # Reset goal position
-        goal_idx = jax.random.choice(rng_goal, all_pos, shape=(1,), p=(~occupied_mask).astype(jnp.float32))
-        goal_pos = jnp.array([goal_idx%max_w, goal_idx//max_w], dtype=jnp.uint32).flatten()
-        
-        return Level(wall_map, goal_pos, agent_pos, agent_dir, width, height)
-    
+        # Place walls
+        wall_choices = jax.random.choice(
+            rng_wall, max_w * max_h, shape=(n_walls,), replace=False
+        )
+        occupied_mask = occupied_mask.at[wall_choices].set(True)
+        for i in range(n_walls):
+            idx = wall_choices[i]
+            y, x = idx // max_w, idx % max_w
+            wall_map = wall_map.at[y, x].set(True)
+
+        def place_object(rng, occupied, num_pixels=1):
+            """Place an object with num_pixels pixels, returning coordinates."""
+            coords = jnp.full((MAX_PIXELS, 2), -1, dtype=jnp.int32)
+
+            # Place first pixel
+            available = ~occupied
+            first_idx = jax.random.choice(rng, all_pos, p=available.astype(jnp.float32))
+            occupied = occupied.at[first_idx].set(True)
+            x, y = first_idx % max_w, first_idx // max_w
+            coords = coords.at[0].set(jnp.array([x, y]))
+
+            return coords, occupied
+
+        # Place agent
+        agent_pos, occupied_mask = place_object(rng_agent, occupied_mask)
+
+        # Place movables and goals
+        m1_pos, occupied_mask = place_object(rng_m1, occupied_mask)
+        g1_pos, occupied_mask = place_object(rng_g1, occupied_mask)
+
+        # Optional second movable/goal pair
+        def place_second_pair(rng, occupied):
+            m2_pos, occupied = place_object(rng, occupied)
+            g2_pos, occupied = place_object(jax.random.split(rng)[1], occupied)
+            return m2_pos, g2_pos, occupied
+
+        def skip_second_pair(rng, occupied):
+            empty = jnp.full((MAX_PIXELS, 2), -1, dtype=jnp.int32)
+            return empty, empty, occupied
+
+        m2_pos, g2_pos, occupied_mask = jax.lax.cond(
+            n_movables >= 2, place_second_pair, skip_second_pair, rng_m2, occupied_mask
+        )
+
+        # Empty positions for m3, m4 (not used in basic generation)
+        empty_coords = jnp.full((MAX_PIXELS, 2), -1, dtype=jnp.int32)
+
+        return Level(
+            agent_pos=agent_pos,
+            m1_pos=m1_pos,
+            m2_pos=m2_pos,
+            m3_pos=empty_coords,
+            m4_pos=empty_coords,
+            g1_pos=g1_pos,
+            g2_pos=g2_pos,
+            wall_map=wall_map,
+            width=width,
+            height=height,
+        )
+
     return sample
 
-def make_level_mutator(max_num_edits: int) -> Callable[[chex.PRNGKey, Level, int], Level]:
-    def mutate(rng: chex.PRNGKey, level: Level, num_edits: int = 1) -> Level:
-        max_w, max_h = level.wall_map.shape[1], level.wall_map.shape[0]
-        all_pos = jnp.arange(max_w * max_h, dtype=jnp.uint32)
-        valid_mask = (all_pos % max_w < level.width) & (all_pos < max_w * level.height)
-        
-        rng, rng_perm, rng_loc, rng_action, rng_goal, rng_agent, rng_agent_dir = jax.random.split(rng, 7)
-        edit_locs = jax.random.permutation(rng_perm, jnp.unique(jax.random.choice(rng_loc, all_pos, shape=(max_num_edits,), p=valid_mask), size=max_num_edits, fill_value=-1))
-        edit_locs = jnp.where(jnp.cumsum(edit_locs != -1) <= num_edits, edit_locs, -1) # mask out extra action
-        actions = jax.random.choice(rng_action, 4, shape=(max_num_edits,))
-        
-        def mutation_step(carry, input):
-            rng, level, agent_displaced, goal_displaced = carry
-            edit_loc, action = input
-            
-            def on_mutate(rng, level, edit_loc, action, agent_displaced, goal_displaced):
-                x, y = edit_loc%max_w, edit_loc//max_w
-                
-                agent_displaced = ((level.agent_pos[0] == x) & (level.agent_pos[1] == y)) | agent_displaced
-                goal_displaced = ((level.goal_pos[0] == x) & (level.goal_pos[1] == y)) | goal_displaced
 
-                def add_wall(rng):
-                    return rng, level.replace(wall_map=level.wall_map.at[y, x].set(True)), agent_displaced, goal_displaced
-                
-                def remove_wall(rng):
-                    return rng, level.replace(wall_map=level.wall_map.at[y, x].set(False)), agent_displaced, goal_displaced
-                
-                def move_agent_pos(rng):
-                    rng, rng_dir = jax.random.split(rng)
-                    agent_pos = jnp.array([x, y], dtype=jnp.uint32)
-                    agent_dir = jnp.array(jax.random.choice(rng_dir, 4), dtype=jnp.uint8)
-                    return rng, level.replace(wall_map=level.wall_map.at[y, x].set(False), agent_pos=agent_pos, agent_dir=agent_dir), False, goal_displaced
-                
-                def move_goal_pos(rng):
-                    goal_pos = jnp.array([x, y], dtype=jnp.uint32)
-                    return rng, level.replace(wall_map=level.wall_map.at[y, x].set(False), goal_pos=goal_pos), agent_displaced, False
-                
-                return jax.lax.switch(action, [
-                    add_wall,
-                    remove_wall,
-                    move_agent_pos,
-                    move_goal_pos
-                ], rng)
-                
-            def do_nothing(rng, level, edit_loc, action, agent_displaced, goal_displaced):
-                return rng, level, agent_displaced, goal_displaced
-                
-            return jax.lax.cond(edit_loc != -1, on_mutate, do_nothing, rng, level, edit_loc, action, agent_displaced, goal_displaced), None
-        (rng, level, agent_displaced, goal_displaced), _ = jax.lax.scan(mutation_step, (rng, level, False, False), (edit_locs, actions))
-        
-        agent_idx = level.agent_pos[1] * max_w + level.agent_pos[0]
-        goal_idx = level.goal_pos[1] * max_w + level.goal_pos[0]
-        
-        # handle displaced goal
-        # NOTE: mark agent position as valid only if there is not a wall there AND agent has been displaced
-        p = (~level.wall_map.flatten() & valid_mask).at[agent_idx].set(agent_displaced & ~(level.wall_map[level.agent_pos[1], level.agent_pos[0]]))
-        new_goal_idx = jax.random.choice(rng_goal, all_pos, p=p)
-        goal_idx = jax.lax.select(goal_displaced, new_goal_idx, goal_idx)
-        goal_pos = jnp.array([goal_idx%max_w, goal_idx//max_w], dtype=jnp.uint32)
-        
-        # handle displaced agent
-        p = (~level.wall_map.flatten() & valid_mask).at[goal_idx].set(False)
-        new_agent_idx = jax.random.choice(rng_agent, all_pos, p=p)
-        new_agent_dir = jnp.array(jax.random.choice(rng_agent_dir, 4), dtype=jnp.uint8)
-        agent_idx = jax.lax.select(agent_displaced, new_agent_idx, agent_idx)
-        agent_pos = jnp.array([agent_idx%max_w, agent_idx//max_w], dtype=jnp.uint32)
-        agent_dir = jax.lax.select(agent_displaced, new_agent_dir, level.agent_dir)
-        
-        new_level = level.replace(goal_pos=goal_pos, agent_pos=agent_pos, agent_dir=agent_dir)
-        
-        # jax.lax.cond(~(new_level.is_well_formatted()), jax.debug.breakpoint, lambda: None)
-        
+class Mutations(IntEnum):
+    """Types of mutations for level editing."""
+
+    NO_OP = 0
+    FLIP_WALL = 1
+    MOVE_AGENT = 2
+    MOVE_M1 = 3
+    MOVE_G1 = 4
+
+
+def make_level_mutator(
+    max_num_edits: int,
+) -> Callable[[chex.PRNGKey, Level, int], Level]:
+    """Create a function that mutates PushWorld levels.
+
+    Args:
+        max_num_edits: Maximum number of edits to apply
+
+    Returns:
+        Function that takes (rng, level, num_edits) and returns mutated Level
+    """
+
+    def mutate(rng: chex.PRNGKey, level: Level, num_edits: int = 1) -> Level:
+        # Use constant grid size to avoid JAX tracing issues
+        max_w, max_h = GRID_SIZE, GRID_SIZE
+        all_pos = jnp.arange(max_w * max_h, dtype=jnp.int32)
+
+        def flip_wall(rng, lvl):
+            """Toggle a random wall cell."""
+            # Don't flip walls where objects are
+            wall_mask = jnp.ones((max_h * max_w,), dtype=jnp.bool_)
+
+            # Mark object positions as invalid
+            def mark_invalid(mask, coords):
+                for i in range(MAX_PIXELS):
+                    x, y = coords[i, 0], coords[i, 1]
+                    idx = y * max_w + x
+                    valid = (x >= 0) & (y >= 0)
+                    mask = jax.lax.cond(
+                        valid, lambda m: m.at[idx].set(False), lambda m: m, mask
+                    )
+                return mask
+
+            wall_mask = mark_invalid(wall_mask, lvl.agent_pos)
+            wall_mask = mark_invalid(wall_mask, lvl.m1_pos)
+            wall_mask = mark_invalid(wall_mask, lvl.m2_pos)
+            wall_mask = mark_invalid(wall_mask, lvl.g1_pos)
+            wall_mask = mark_invalid(wall_mask, lvl.g2_pos)
+
+            flip_idx = jax.random.choice(
+                rng, max_h * max_w, p=wall_mask.astype(jnp.float32)
+            )
+            flip_y, flip_x = flip_idx // max_w, flip_idx % max_w
+            new_val = ~lvl.wall_map[flip_y, flip_x]
+            new_wall_map = lvl.wall_map.at[flip_y, flip_x].set(new_val)
+
+            return lvl.replace(wall_map=new_wall_map)
+
+        def move_object(rng, lvl, coords_attr):
+            """Move an object to a random valid position."""
+            coords = getattr(lvl, coords_attr)
+
+            # Find valid positions (not walls, not other objects)
+            valid_mask = ~lvl.wall_map.flatten()
+
+            # Pick new position
+            new_idx = jax.random.choice(rng, all_pos, p=valid_mask.astype(jnp.float32))
+            new_x, new_y = new_idx % max_w, new_idx // max_w
+
+            # Update first pixel, keep rest invalid
+            new_coords = jnp.full((MAX_PIXELS, 2), -1, dtype=jnp.int32)
+            new_coords = new_coords.at[0].set(jnp.array([new_x, new_y]))
+
+            return lvl.replace(**{coords_attr: new_coords})
+
+        def apply_mutation(carry, step):
+            rng, lvl = carry
+            mutation_rng, mutation_type = step
+
+            rng, apply_rng = jax.random.split(rng)
+
+            def do_flip_wall(_):
+                return flip_wall(mutation_rng, lvl)
+
+            def do_move_agent(_):
+                return move_object(mutation_rng, lvl, "agent_pos")
+
+            def do_move_m1(_):
+                return move_object(mutation_rng, lvl, "m1_pos")
+
+            def do_move_g1(_):
+                return move_object(mutation_rng, lvl, "g1_pos")
+
+            def do_nothing(_):
+                return lvl
+
+            new_lvl = jax.lax.switch(
+                mutation_type,
+                [
+                    do_nothing,  # NO_OP
+                    do_flip_wall,  # FLIP_WALL
+                    do_move_agent,  # MOVE_AGENT
+                    do_move_m1,  # MOVE_M1
+                    do_move_g1,  # MOVE_G1
+                ],
+                None,
+            )
+
+            return (rng, new_lvl), None
+
+        # Generate mutation types and apply
+        rng, *mrngs = jax.random.split(rng, max_num_edits + 1)
+        mutation_types = jax.random.choice(rng, len(Mutations), shape=(max_num_edits,))
+        # Mask out mutations beyond num_edits
+        mutation_types = jnp.where(
+            jnp.arange(max_num_edits) < num_edits, mutation_types, Mutations.NO_OP
+        )
+
+        (_, new_level), _ = jax.lax.scan(
+            apply_mutation, (rng, level), (jnp.array(mrngs), mutation_types)
+        )
+
         return new_level
-    
+
     return mutate
 
-# This function is a modified version of
-# https://github.com/facebookresearch/minimax/blob/2ae9e04d37f97d7c14308f5a26237dcfca63470f/src/minimax/envs/maze/maze_mutators.py.
-# Credit: minimax
-def make_level_mutator_minimax(max_num_edits: int) -> Callable[[chex.PRNGKey, Level, int], Level]:
-    class Mutations(IntEnum):
-        # Turn left, turn right, move forward
+
+def make_level_mutator_minimax(
+    max_num_edits: int,
+) -> Callable[[chex.PRNGKey, Level, int], Level]:
+    """Create a mutation function inspired by the minimax approach.
+
+    This is a simplified version focused on wall flipping and goal moving.
+    """
+
+    class MinimaxMutations(IntEnum):
         NO_OP = 0
         FLIP_WALL = 1
-        MOVE_GOAL = 2
-    
-    def flip_wall(rng, state):
-        wall_map = state.wall_map
-        h,w = wall_map.shape
-        wall_mask = jnp.ones((h*w,), dtype=jnp.bool_)
+        MOVE_G1 = 2
 
-        goal_idx = w*state.goal_pos[1] + state.goal_pos[0]
-        agent_idx = w*state.agent_pos[1] + state.agent_pos[0]
-        wall_mask = wall_mask.at[goal_idx].set(False)
-        wall_mask = wall_mask.at[agent_idx].set(False)
+    def flip_wall(rng, level):
+        # Use constant grid size to avoid JAX tracing issues
+        max_w, max_h = GRID_SIZE, GRID_SIZE
 
-        flip_idx = jax.random.choice(rng, np.arange(h*w), p=wall_mask)
-        flip_y = flip_idx//w
-        flip_x = flip_idx%w
+        # Create mask excluding object positions
+        wall_mask = jnp.ones((max_h * max_w,), dtype=jnp.bool_)
 
-        flip_val = ~wall_map.at[flip_y,flip_x].get()
-        next_wall_map = wall_map.at[flip_y,flip_x].set(flip_val)
+        def mark_occupied(mask, coords):
+            for i in range(MAX_PIXELS):
+                x, y = coords[i, 0], coords[i, 1]
+                valid = (x >= 0) & (y >= 0)
+                idx = y * max_w + x
+                mask = jax.lax.cond(
+                    valid, lambda m: m.at[idx].set(False), lambda m: m, mask
+                )
+            return mask
 
-        return state.replace(wall_map=next_wall_map)
+        wall_mask = mark_occupied(wall_mask, level.agent_pos)
+        wall_mask = mark_occupied(wall_mask, level.m1_pos)
+        wall_mask = mark_occupied(wall_mask, level.g1_pos)
+        wall_mask = mark_occupied(wall_mask, level.m2_pos)
+        wall_mask = mark_occupied(wall_mask, level.g2_pos)
 
+        flip_idx = jax.random.choice(
+            rng, max_h * max_w, p=wall_mask.astype(jnp.float32)
+        )
+        flip_y, flip_x = flip_idx // max_w, flip_idx % max_w
 
-    def move_goal(rng, state):
-        wall_map = state.wall_map
-        h,w = wall_map.shape
-        wall_mask = wall_map.flatten()
+        flip_val = ~level.wall_map[flip_y, flip_x]
+        new_wall_map = level.wall_map.at[flip_y, flip_x].set(flip_val)
 
-        goal_idx = w*state.goal_pos[1] + state.goal_pos[0]
-        agent_idx = w*state.agent_pos[1] + state.agent_pos[0]
-        wall_mask = wall_mask.at[goal_idx].set(True)
-        wall_mask = wall_mask.at[agent_idx].set(True)
+        return level.replace(wall_map=new_wall_map)
 
-        next_goal_idx = jax.random.choice(rng, np.arange(h*w), p=~wall_mask)
-        next_goal_y = next_goal_idx//w
-        next_goal_x = next_goal_idx%w
+    def move_g1(rng, level):
+        # Use constant grid size to avoid JAX tracing issues
+        max_w, max_h = GRID_SIZE, GRID_SIZE
 
-        next_wall_map = wall_map.at[next_goal_y,next_goal_x].set(False)
-        next_goal_pos = jnp.array([next_goal_x,next_goal_y], dtype=jnp.uint32)
+        # Valid positions: not walls, not occupied by agent/m1
+        valid_mask = ~level.wall_map.flatten()
 
-        return state.replace(wall_map=next_wall_map, goal_pos=next_goal_pos)
+        def mark_occupied(mask, coords):
+            for i in range(MAX_PIXELS):
+                x, y = coords[i, 0], coords[i, 1]
+                valid = (x >= 0) & (y >= 0)
+                idx = y * max_w + x
+                mask = jax.lax.cond(
+                    valid, lambda m: m.at[idx].set(False), lambda m: m, mask
+                )
+            return mask
 
-    def move_goal_flip_walls(rng, level, n=1):
+        valid_mask = mark_occupied(valid_mask, level.agent_pos)
+        valid_mask = mark_occupied(valid_mask, level.m1_pos)
+
+        new_idx = jax.random.choice(
+            rng, max_h * max_w, p=valid_mask.astype(jnp.float32)
+        )
+        new_y, new_x = new_idx // max_w, new_idx % max_w
+
+        new_g1_pos = jnp.full((MAX_PIXELS, 2), -1, dtype=jnp.int32)
+        new_g1_pos = new_g1_pos.at[0].set(jnp.array([new_x, new_y]))
+
+        # Clear wall at new goal position
+        new_wall_map = level.wall_map.at[new_y, new_x].set(False)
+
+        return level.replace(g1_pos=new_g1_pos, wall_map=new_wall_map)
+
+    def mutate(rng: chex.PRNGKey, level: Level, n: int = 1) -> Level:
         def _mutate(carry, step):
-            state = carry
-            rng, mutation = step
+            lvl = carry
+            mutation_rng, mutation = step
 
-            def _apply(rng, state):    
-                rng, arng, brng = jax.random.split(rng, 3)
+            def _apply(rng, lvl):
+                rng, flip_rng, move_rng = jax.random.split(rng, 3)
 
-                is_flip_wall = jnp.equal(mutation, Mutations.FLIP_WALL.value)
-                mutated_state = flip_wall(arng, state)
-                next_state = jax.tree_util.tree_map(lambda x,y: jax.lax.select(is_flip_wall, x, y), mutated_state, state)
+                is_flip = jnp.equal(mutation, MinimaxMutations.FLIP_WALL.value)
+                flipped = flip_wall(flip_rng, lvl)
+                next_lvl = jax.tree_util.tree_map(
+                    lambda x, y: jax.lax.select(is_flip, x, y), flipped, lvl
+                )
 
-                is_move_goal = jnp.equal(mutation, Mutations.MOVE_GOAL.value)
-                mutated_state = move_goal(brng, state)
-                next_state = jax.tree_util.tree_map(lambda x,y: jax.lax.select(is_move_goal, x, y), mutated_state, next_state)
-                
-                return next_state
-                
-            return jax.lax.cond(mutation != -1, _apply, lambda *_: state, rng, state), None
+                is_move = jnp.equal(mutation, MinimaxMutations.MOVE_G1.value)
+                moved = move_g1(move_rng, lvl)
+                next_lvl = jax.tree_util.tree_map(
+                    lambda x, y: jax.lax.select(is_move, x, y), moved, next_lvl
+                )
 
-        rng, nrng, *mrngs = jax.random.split(rng, max_num_edits+2)
-        mutations = jax.random.choice(nrng, np.arange(len(Mutations)), (max_num_edits,))
-        mutations = jnp.where(jnp.arange(max_num_edits) < n, mutations, -1) # mask out extra mutations
+                return next_lvl
+
+            return jax.lax.cond(
+                mutation != MinimaxMutations.NO_OP.value,
+                _apply,
+                lambda *_: lvl,
+                mutation_rng,
+                lvl,
+            ), None
+
+        rng, nrng, *mrngs = jax.random.split(rng, max_num_edits + 2)
+        mutations = jax.random.choice(
+            nrng, len(MinimaxMutations), shape=(max_num_edits,)
+        )
+        mutations = jnp.where(
+            jnp.arange(max_num_edits) < n, mutations, MinimaxMutations.NO_OP.value
+        )
 
         new_level, _ = jax.lax.scan(_mutate, level, (jnp.array(mrngs), mutations))
 
         return new_level
-    
-    return move_goal_flip_walls
+
+    return mutate

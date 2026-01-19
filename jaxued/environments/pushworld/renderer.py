@@ -1,151 +1,282 @@
-import numpy as np
-import jax
-import jax.numpy as jnp
-import chex
+"""
+PushWorld Renderer for visual logging.
 
-from jaxued.environments.underspecified_env import EnvParams, EnvState
-from .env import DIR_TO_VEC, Maze
+Renders PushWorld states/levels as RGB images, compatible with JAX JIT.
+"""
+
 from functools import partial
 
-class MazeRenderer(object):
-    """This class renders the maze for visual logging, compatible with jit.
+import chex
+import jax
+import jax.numpy as jnp
+import numpy as np
 
-        Args:
-            env (Maze): 
-            tile_size (int, optional): The number of pixels each tile should take up. Defaults to 32.
-            render_border (bool, optional): If true, renders the one-tile thick border around the level. Defaults to True.
+from .env import (
+    CHANNEL_AGENT,
+    CHANNEL_G1,
+    CHANNEL_G2,
+    CHANNEL_M1,
+    CHANNEL_M2,
+    CHANNEL_M3,
+    CHANNEL_M4,
+    CHANNEL_WALL,
+    GRID_SIZE,
+    EnvParams,
+    EnvState,
+    Observation,
+    PushWorld,
+)
+from .level import Level
+
+# Color palette matching the original PushWorld video rendering
+# From xminigrid's COLOR_MAP:
+#   0: White (background)
+#   1: Green (agent)
+#   2: Blue (movable without goal)
+#   3: Red (movable with goal - m1, m2 when g2 exists)
+#   4: Black (wall)
+#   5: Light Red (empty goal)
+#   6: Red (filled goal)
+COLORS = {
+    "empty": np.array([255, 255, 255]),  # White background
+    "wall": np.array([0, 0, 0]),  # Black walls
+    "agent": np.array([0, 255, 0]),  # Green agent
+    "m1": np.array([255, 0, 0]),  # Red (has goal g1)
+    "m2": np.array([0, 0, 255]),  # Blue (default, changes to red if g2 exists)
+    "m3": np.array([0, 0, 255]),  # Blue movable
+    "m4": np.array([0, 0, 255]),  # Blue movable
+    "g1": np.array([255, 127, 127]),  # Light red (empty goal)
+    "g2": np.array([255, 127, 127]),  # Light red (empty goal)
+    "grid_line": np.array([200, 200, 200]),  # Light grey grid lines
+}
+
+
+class PushWorldRenderer:
+    """Renderer for PushWorld environment states.
+
+    Args:
+        env: The PushWorld environment instance.
+        tile_size: Number of pixels per grid tile.
+        render_grid_lines: Whether to render grid lines.
     """
-    def __init__(self, env: Maze, tile_size: int=32, render_border: bool=True):
+
+    def __init__(
+        self,
+        env: PushWorld,
+        tile_size: int = 32,
+        render_grid_lines: bool = True,
+    ):
         self.env = env
         self.tile_size = tile_size
-        self.render_border = render_border
-        self._atlas = jnp.array(_make_tile_atlas(tile_size))
-        
+        self.render_grid_lines = render_grid_lines
+        self._atlas = jnp.array(_make_tile_atlas(tile_size, render_grid_lines))
+
     @partial(jax.jit, static_argnums=(0,))
-    def render_level(self, level, env_params):
-        # For Minigrid, env_state contains all attributes of level,
-        # and only uses these attributes. So can just call render_state.
-        # However, in general, these routines may be a bit different.
-        # For example, levels may map to many different start states.
-        # As such, one may want to render an image representative of all
-        # possible start states when rendering a level.
-        return self.render_state(level, env_params)
-    
+    def render_level(self, level: Level, env_params: EnvParams) -> chex.Array:
+        """Render a Level as an RGB image."""
+        # Create state from level
+        state = self.env.init_state_from_level(level)
+        return self.render_state(state, env_params)
+
     @partial(jax.jit, static_argnums=(0,))
-    def render_state(self, env_state: EnvState, env_params: EnvParams) -> chex.Array:
+    def render_state(self, state: EnvState, env_params: EnvParams) -> chex.Array:
+        """Render an EnvState as an RGB image.
+
+        Color logic (matching original PushWorld):
+        - Background: White
+        - Walls: Black
+        - Agent: Green
+        - M1: Red (always has goal g1)
+        - M2: Red if g2 exists, Blue otherwise
+        - M3, M4: Blue
+        - Goals (empty): Light red
+        - Filled goal (movable on goal): Red
+        """
         tile_size = self.tile_size
-        nrows = self.env.max_height + 2*self.render_border
-        ncols = self.env.max_width + 2*self.render_border
-        width_px = ncols * tile_size
-        height_px = nrows * tile_size
-        
-        agent_pos = env_state.agent_pos + self.render_border
-        goal_pos = env_state.goal_pos + self.render_border
-        
-        if self.render_border:
-            cells = jnp.pad(jnp.where(env_state.wall_map, 1, 0), 1, mode="constant", constant_values=True)
-        else:
-            cells = jnp.where(env_state.wall_map, 1, 0)
-        cells = jnp.where(cells, 1, 0)
-        cells = cells.at[agent_pos[1], agent_pos[0]].set(3 + env_state.agent_dir)
-        cells = cells.at[goal_pos[1], goal_pos[0]].set(2)
-        
-        img = self._atlas[cells].transpose(0, 2, 1, 3, 4).reshape(height_px, width_px, 3)
-        
-        f_vec = DIR_TO_VEC[env_state.agent_dir]
-        r_vec = jnp.array([-f_vec[1], f_vec[0]])
+        grid_size = self.env.grid_size
+        width_px = grid_size * tile_size
+        height_px = grid_size * tile_size
 
-        agent_view_size = self.env.agent_view_size
+        # Check if g2 exists (has any valid pixels)
+        g2_exists = jnp.any(state.g2_pos[:, 0] >= 0)
 
-        min_bound = jnp.min(jnp.stack([
-            agent_pos, 
-            agent_pos + f_vec*(agent_view_size-1), 
-            agent_pos - r_vec*(agent_view_size//2), 
-            agent_pos + r_vec*(agent_view_size//2),
-        ]), 0)
+        # Tile indices:
+        # 0=empty(white), 1=wall(black), 2=agent(green),
+        # 3=movable_goal(red), 4=movable(blue), 5=goal_empty(light red)
+        cells = jnp.zeros((grid_size, grid_size), dtype=jnp.int32)
 
-        min_x = jnp.minimum(jnp.maximum(min_bound[0], 0), env_state.wall_map.shape[0] - 1 + 2*self.render_border)
-        min_y = jnp.minimum(jnp.maximum(min_bound[1], 0), env_state.wall_map.shape[1] - 1 + 2*self.render_border)
-        max_x = jnp.minimum(jnp.maximum(min_bound[0]+agent_view_size, 0), env_state.wall_map.shape[0] + 2*self.render_border)
-        max_y = jnp.minimum(jnp.maximum(min_bound[1]+agent_view_size, 0), env_state.wall_map.shape[1] + 2*self.render_border)
-        
-        all_pos = jnp.arange(ncols * nrows)
-        mask = \
-            ((all_pos % ncols) >= min_x) & \
-            ((all_pos % ncols) < max_x) & \
-            ((all_pos // ncols) >= min_y) & \
-            ((all_pos // ncols) < max_y)
-        mask = jnp.kron(mask.reshape(nrows, ncols), jnp.ones((self.tile_size, self.tile_size)))[..., None]
-        
-        highlight_img = (img + 0.3 * (255 - img)).astype(jnp.uint8).clip(0, 255)
-        return jnp.where(mask, highlight_img, img)
-    
-def _make_tile_atlas(tile_size):
-    TRI_COORDS = np.array([
-        [0.12, 0.19],
-        [0.87, 0.50],
-        [0.12, 0.81],
-    ])
-    
-    def fill_coords(img, fn, color):
-        new_img = img.copy()
-        for y in range(img.shape[0]):
-            for x in range(img.shape[1]):
-                yf = (y + 0.5) / img.shape[0]
-                xf = (x + 0.5) / img.shape[1]
-                if fn(xf, yf):
-                    new_img[y, x] = color
-        return new_img
+        # Place walls (black)
+        cells = jnp.where(state.wall_map, 1, cells)
 
-    def point_in_rect(xmin, xmax, ymin, ymax):
-        def fn(x, y):
-            return x >= xmin and x <= xmax and y >= ymin and y <= ymax
-        return fn
+        # Place goals (light red for empty)
+        cells = self._place_pixels(cells, state.g1_pos, 5)
+        cells = self._place_pixels(cells, state.g2_pos, 5)
 
-    def point_in_triangle(a, b, c):
-        a = np.array(a)
-        b = np.array(b)
-        c = np.array(c)
+        # Place movables - m3, m4 always blue
+        cells = self._place_pixels(cells, state.m4_pos, 4)
+        cells = self._place_pixels(cells, state.m3_pos, 4)
 
-        def fn(x, y):
-            v0 = c - a
-            v1 = b - a
-            v2 = np.array((x, y)) - a
+        # m2: red if g2 exists, blue otherwise
+        m2_color = jax.lax.select(g2_exists, 3, 4)
+        cells = self._place_pixels_dynamic(cells, state.m2_pos, m2_color)
 
-            # Compute dot products
-            dot00 = np.dot(v0, v0)
-            dot01 = np.dot(v0, v1)
-            dot02 = np.dot(v0, v2)
-            dot11 = np.dot(v1, v1)
-            dot12 = np.dot(v1, v2)
+        # m1: always red (has goal g1)
+        cells = self._place_pixels(cells, state.m1_pos, 3)
 
-            # Compute barycentric coordinates
-            inv_denom = 1 / (dot00 * dot11 - dot01 * dot01)
-            u = (dot11 * dot02 - dot01 * dot12) * inv_denom
-            v = (dot00 * dot12 - dot01 * dot02) * inv_denom
+        # Place agent (green, highest priority)
+        cells = self._place_pixels(cells, state.agent_pos, 2)
 
-            # Check if point is in triangle
-            return (u >= 0) and (v >= 0) and (u + v) < 1
+        # Render using atlas
+        img = (
+            self._atlas[cells].transpose(0, 2, 1, 3, 4).reshape(height_px, width_px, 3)
+        )
 
-        return fn
-    
-    atlas = np.empty((7, tile_size, tile_size, 3), dtype=np.uint8)
-    
-    def add_border(tile):
-        new_tile = fill_coords(tile, point_in_rect(0, 0.031, 0, 1), (100, 100, 100)) 
-        return fill_coords(new_tile, point_in_rect(0, 1, 0, 0.031), (100, 100, 100)) 
-    
-    atlas[0] = add_border(np.tile([0, 0, 0], (tile_size, tile_size, 1))) # empty
-    atlas[1] = np.tile([100, 100, 100], (tile_size, tile_size, 1)) # wall
-    atlas[2] = np.tile([0, 255, 0], (tile_size, tile_size, 1)) # goal
-    
-    # Handle player
-    agent_tile = np.tile([0, 0, 0], (tile_size, tile_size, 1))
-    agent_tile = fill_coords(agent_tile, point_in_triangle(*TRI_COORDS), [255, 0, 0])
-    
-    atlas[3] = add_border(agent_tile) # right
-    atlas[4] = add_border(np.rot90(agent_tile, k=3)) # down
-    atlas[5] = add_border(np.rot90(agent_tile, k=2)) # left
-    atlas[6] = add_border(np.rot90(agent_tile, k=1)) # up
-    
+        return img
+
+    @partial(jax.jit, static_argnums=(0,))
+    def render_observation(self, obs: Observation, env_params: EnvParams) -> chex.Array:
+        """Render an Observation as an RGB image.
+
+        Matches the original PushWorld color scheme.
+        """
+        tile_size = self.tile_size
+        grid_size = self.env.grid_size
+        width_px = grid_size * tile_size
+        height_px = grid_size * tile_size
+
+        # Extract channels
+        agent = obs.image[:, :, CHANNEL_AGENT]
+        m1 = obs.image[:, :, CHANNEL_M1]
+        m2 = obs.image[:, :, CHANNEL_M2]
+        m3 = obs.image[:, :, CHANNEL_M3]
+        m4 = obs.image[:, :, CHANNEL_M4]
+        g1 = obs.image[:, :, CHANNEL_G1]
+        g2 = obs.image[:, :, CHANNEL_G2]
+        walls = obs.image[:, :, CHANNEL_WALL]
+
+        # Check if g2 exists
+        g2_exists = jnp.any(g2 > 0)
+
+        # Tile indices:
+        # 0=empty(white), 1=wall(black), 2=agent(green),
+        # 3=movable_goal(red), 4=movable(blue), 5=goal_empty(light red)
+        cells = jnp.zeros((grid_size, grid_size), dtype=jnp.int32)
+
+        # Layer walls (black)
+        cells = jnp.where(walls > 0, 1, cells)
+
+        # Layer goals (light red for empty)
+        cells = jnp.where(g1 > 0, 5, cells)
+        cells = jnp.where(g2 > 0, 5, cells)
+
+        # Layer movables - m3, m4 always blue
+        cells = jnp.where(m4 > 0, 4, cells)
+        cells = jnp.where(m3 > 0, 4, cells)
+
+        # m2: red if g2 exists, blue otherwise
+        m2_color = jax.lax.select(g2_exists, 3, 4)
+        cells = jnp.where(m2 > 0, m2_color, cells)
+
+        # m1: always red (has goal g1)
+        cells = jnp.where(m1 > 0, 3, cells)
+
+        # Layer agent (green, highest priority)
+        cells = jnp.where(agent > 0, 2, cells)
+
+        # Render using atlas
+        img = (
+            self._atlas[cells].transpose(0, 2, 1, 3, 4).reshape(height_px, width_px, 3)
+        )
+
+        return img
+
+    def _place_pixels(
+        self,
+        cells: chex.Array,
+        coords: chex.Array,
+        value: int,
+    ) -> chex.Array:
+        """Place object pixels on cell grid with static value."""
+
+        def place_one(cells, coord):
+            x, y = coord
+            valid = (x >= 0) & (y >= 0) & (x < GRID_SIZE) & (y < GRID_SIZE)
+            cells = jax.lax.cond(
+                valid, lambda c: c.at[y, x].set(value), lambda c: c, cells
+            )
+            return cells, None
+
+        cells, _ = jax.lax.scan(place_one, cells, coords)
+        return cells
+
+    def _place_pixels_dynamic(
+        self,
+        cells: chex.Array,
+        coords: chex.Array,
+        value: chex.Array,
+    ) -> chex.Array:
+        """Place object pixels on cell grid with dynamic value."""
+
+        def place_one(cells, coord):
+            x, y = coord
+            valid = (x >= 0) & (y >= 0) & (x < GRID_SIZE) & (y < GRID_SIZE)
+            cells = jax.lax.cond(
+                valid, lambda c: c.at[y, x].set(value), lambda c: c, cells
+            )
+            return cells, None
+
+        cells, _ = jax.lax.scan(place_one, cells, coords)
+        return cells
+
+
+def _make_tile_atlas(tile_size: int, render_grid_lines: bool = True) -> np.ndarray:
+    """Create tile atlas with all tile types.
+
+    Tile indices (matching original PushWorld color scheme):
+    0 = empty (white background)
+    1 = wall (black)
+    2 = agent (green)
+    3 = movable_goal (red - m1, or m2 when g2 exists)
+    4 = movable (blue - m3, m4, or m2 when no g2)
+    5 = goal_empty (light red)
+    """
+    atlas = np.empty((6, tile_size, tile_size, 3), dtype=np.uint8)
+
+    def fill_solid(color):
+        tile = np.tile(color, (tile_size, tile_size, 1))
+        if render_grid_lines:
+            tile = add_border(tile, COLORS["grid_line"])
+        return tile
+
+    def add_border(tile, color, width=1):
+        tile = tile.copy()
+        tile[:width, :] = color
+        tile[-width:, :] = color
+        tile[:, :width] = color
+        tile[:, -width:] = color
+        return tile
+
+    # Build atlas with simple solid colors (matching original PushWorld)
+    atlas[0] = fill_solid(COLORS["empty"])  # White background
+    atlas[1] = fill_solid(COLORS["wall"])  # Black wall
+    atlas[2] = fill_solid(COLORS["agent"])  # Green agent
+    atlas[3] = fill_solid(COLORS["m1"])  # Red movable (has goal)
+    atlas[4] = fill_solid(COLORS["m3"])  # Blue movable (no goal)
+    atlas[5] = fill_solid(COLORS["g1"])  # Light red goal
+
     return atlas
+
+
+def render_to_rgb(state_or_obs, env: PushWorld, tile_size: int = 32) -> np.ndarray:
+    """Convenience function to render state or observation to RGB.
+
+    Non-JIT version for debugging.
+    """
+    renderer = PushWorldRenderer(env, tile_size)
+
+    if isinstance(state_or_obs, EnvState):
+        return np.array(renderer.render_state(state_or_obs, env.default_params))
+    elif isinstance(state_or_obs, Observation):
+        return np.array(renderer.render_observation(state_or_obs, env.default_params))
+    else:
+        raise TypeError(f"Expected EnvState or Observation, got {type(state_or_obs)}")

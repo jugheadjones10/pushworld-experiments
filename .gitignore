@@ -4,16 +4,22 @@ __pycache__/
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
 
 # Virtual environments
-.venv
+.venv/
 
 # Model checkpoints and training artifacts
 checkpoints/
 
 # Weights & Biases
 wandb/
+
+# Hydra outputs
+outputs/
+
+# SLURM logs
+logs/
 
 # macOS
 .DS_Store
@@ -24,7 +30,14 @@ wandb/
 # IDE
 .idea/
 .vscode/
+*.code-workspace
 
 # Environment variables
 .env
 .env.local
+
+# JAX compilation cache
+.jax_cache/
+
+# Package manager lock files (uncomment if you want to track)
+# uv.lock

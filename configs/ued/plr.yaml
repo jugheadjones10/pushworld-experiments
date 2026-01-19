@@ -1,0 +1,13 @@
+# PLR (Prioritized Level Replay) Hyperparameters
+use_accel: false
+exploratory_grad_updates: false
+num_edits: 5
+score_function: MaxMC  # MaxMC or pvl
+level_buffer_capacity: 4000
+replay_prob: 0.8
+staleness_coeff: 0.3
+temperature: 0.3
+topk_k: 4
+minimum_fill_ratio: 0.5
+prioritization: rank  # rank or topk
+buffer_duplicate_check: true
