@@ -339,20 +339,64 @@ class Benchmark:
 
     @classmethod
     def load_from_path(cls, path: str):
-        """Load benchmark from a bz2-compressed pickle file."""
+        """Load benchmark from a bz2-compressed pickle file.
+        
+        Handles JAX version incompatibility by using a custom unpickler
+        that converts old JAX arrays to numpy arrays.
+        """
+        import io
+        
+        class JaxCompatUnpickler(pickle.Unpickler):
+            """Custom unpickler that handles JAX version incompatibility."""
+            
+            def find_class(self, module, name):
+                # Redirect JAX array reconstruction to numpy
+                if module.startswith("jax") and "array" in name.lower():
+                    return np.array
+                # Handle old jax._src.core types
+                if module == "jax._src.core" and name == "ShapedArray":
+                    # Return a dummy that will be replaced
+                    return lambda *args, **kwargs: None
+                if module == "jax._src.array" and name == "_reconstruct_array":
+                    # Return numpy array constructor instead
+                    return lambda *args, **kwargs: np.array(args[0]) if args else np.array([])
+                return super().find_class(module, name)
+        
         with bz2.open(path, "rb") as f:
-            data = pickle.load(f)
+            try:
+                # First try normal loading
+                data = pickle.load(f)
+            except (TypeError, AttributeError) as e:
+                # If JAX version incompatibility, try with custom unpickler
+                f.seek(0)
+                try:
+                    data = JaxCompatUnpickler(f).load()
+                except Exception:
+                    # Last resort: re-download and try again
+                    f.close()
+                    os.remove(path)
+                    raise RuntimeError(
+                        f"Failed to load benchmark from {path}. "
+                        f"The file may be corrupted or incompatible. "
+                        f"Please re-run to download a fresh copy. Original error: {e}"
+                    )
+        
+        # Convert to numpy first, then to jax arrays
+        train = np.asarray(data["train"]) if hasattr(data["train"], '__array__') else data["train"]
+        test = np.asarray(data["test"]) if hasattr(data["test"], '__array__') else data["test"]
+        
         return cls(
-            train_puzzles=jnp.array(data["train"]),
-            test_puzzles=jnp.array(data["test"]),
+            train_puzzles=jnp.array(train),
+            test_puzzles=jnp.array(test),
         )
 
     @classmethod
-    def load(cls, name: str):
+    def load(cls, name: str, force_redownload: bool = False):
         """Load a benchmark by name, auto-downloading from HuggingFace if needed.
         
         Args:
             name: One of 'level0_transformed_all', 'level0_transformed_base', 'level0_mini'
+            force_redownload: If True, delete cached file and re-download
         
         Returns:
             Benchmark instance with train and test puzzles
@@ -368,11 +412,42 @@ class Benchmark:
 
         os.makedirs(DATA_PATH, exist_ok=True)
         path = os.path.join(DATA_PATH, NAME2HFFILENAME[name])
+        numpy_path = path.replace(".pkl", "_numpy.pkl")
+
+        # Check for numpy-converted cache first
+        if os.path.exists(numpy_path) and not force_redownload:
+            print(f"Loading from numpy cache: {numpy_path}")
+            with bz2.open(numpy_path, "rb") as f:
+                data = pickle.load(f)
+            return cls(
+                train_puzzles=jnp.array(data["train"]),
+                test_puzzles=jnp.array(data["test"]),
+            )
+
+        if force_redownload and os.path.exists(path):
+            os.remove(path)
+        if force_redownload and os.path.exists(numpy_path):
+            os.remove(numpy_path)
 
         if not os.path.exists(path):
             _download_from_hf(HF_REPO_ID, NAME2HFFILENAME[name])
 
-        return cls.load_from_path(path)
+        # Load and convert to numpy cache for future use
+        benchmark = cls.load_from_path(path)
+        
+        # Save numpy version for faster future loads
+        try:
+            numpy_data = {
+                "train": np.asarray(benchmark.train_puzzles),
+                "test": np.asarray(benchmark.test_puzzles),
+            }
+            with bz2.open(numpy_path, "wb") as f:
+                pickle.dump(numpy_data, f)
+            print(f"Saved numpy cache: {numpy_path}")
+        except Exception as e:
+            print(f"Warning: Could not save numpy cache: {e}")
+        
+        return benchmark
 
     @classmethod
     def from_prefabs(cls, train_ids: list, test_ids: list):
